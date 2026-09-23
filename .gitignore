@@ -1,0 +1,38 @@
+# ---- Build output ----
+build/
+dist/
+tests/build/
+
+# ---- IDEs / editors ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# ---- Local build config (your machine's GAME_DIR) ----
+config.mk
+
+# ---- Python tooling ----
+__pycache__/
+*.py[cod]
+
+# ---- OS junk ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- Misc ----
+*.log
+
+# ---- local save backups (never commit a save file) ----
+.save-backup-*/
+
+# ---- reverse-engineering artefacts (never commit game data) ----
+*.dumped.exe
+*.fixed.exe
+*.methods.bin
+ghidra_proj/
+
+# ---- editor tooling (clangd flags for the mingw target) ----
+compile_flags.txt

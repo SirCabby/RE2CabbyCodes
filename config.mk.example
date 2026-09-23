@@ -1,0 +1,9 @@
+# Copy this file to config.mk and set your local path.
+#   cp config.mk.example config.mk
+# config.mk is gitignored, so your personal values never enter the repo.
+
+# Absolute path to your Resident Evil 2 folder - the directory containing
+# "re2.exe". The path may contain spaces; that is fine - do not quote it here.
+# Windows example:      GAME_DIR := C:/Program Files (x86)/Steam/steamapps/common/RESIDENT EVIL 2  BIOHAZARD RE2
+# Linux/Proton example: GAME_DIR := /home/you/.local/share/Steam/steamapps/common/RESIDENT EVIL 2  BIOHAZARD RE2
+GAME_DIR := /path/to/RESIDENT EVIL 2  BIOHAZARD RE2
