@@ -146,20 +146,23 @@ install: $(TARGET)
 	fi; \
 	orig="$(GAME_DIR)/$(ORIG).dll"; \
 	live="$(GAME_DIR)/$(NAME).dll"; \
-	if [ -f "$$orig" ]; then \
-	  echo ">> stock original already preserved at $$orig"; \
-	else \
-	  stock=$$(ls "$(GAME_DIR)" | grep -ix '$(NAME)\.dll' | head -1); \
-	  if [ -z "$$stock" ]; then echo "ERROR: no $(NAME).dll in '$(GAME_DIR)'."; exit 1; fi; \
-	  if grep -aq "$(PROJECT)" "$(GAME_DIR)/$$stock" 2>/dev/null; then \
-	    echo "ERROR: $(GAME_DIR)/$$stock is already our proxy, but $$orig is missing."; \
-	    echo "       Refusing to save the mod as the 'stock' original."; \
-	    echo "       Restore the real $(NAME).dll (Steam: Verify integrity of game files),"; \
-	    echo "       then re-run make install."; \
-	    exit 1; \
+	stock=$$(ls "$(GAME_DIR)" | grep -ix '$(NAME)\.dll' | head -1); \
+	if [ -n "$$stock" ] && ! grep -aq "$(PROJECT)" "$(GAME_DIR)/$$stock" 2>/dev/null; then \
+	  if [ -f "$$orig" ] && ! cmp -s "$(GAME_DIR)/$$stock" "$$orig"; then \
+	    echo ">> $$stock is the game's own and not the one in $(ORIG).dll (a game update, a switch of"; \
+	    echo ">> Steam branch, a verify): the game's current one becomes the original"; \
 	  fi; \
 	  mv -f "$(GAME_DIR)/$$stock" "$$orig"; \
 	  echo ">> preserved stock $$stock -> $(ORIG).dll"; \
+	elif [ -f "$$orig" ]; then \
+	  echo ">> stock original already preserved at $$orig"; \
+	else \
+	  if [ -z "$$stock" ]; then echo "ERROR: no $(NAME).dll in '$(GAME_DIR)'."; exit 1; fi; \
+	  echo "ERROR: $(GAME_DIR)/$$stock is already our proxy, but $$orig is missing."; \
+	  echo "       Refusing to save the mod as the 'stock' original."; \
+	  echo "       Restore the real $(NAME).dll (Steam: Verify integrity of game files),"; \
+	  echo "       then re-run make install."; \
+	  exit 1; \
 	fi; \
 	t="$$live.re2cc-new.$$$$"; cp -f $(TARGET) "$$t"; mv -f "$$t" "$$live"; \
 	echo ">> installed (atomic) $$live"; \
@@ -212,8 +215,24 @@ dist: $(TARGET)
 	  "  That is all - on Windows and on Linux/Proton alike. No launch options," \
 	  "  and dinput8.dll stays free for REFramework." \
 	  "" \
+	  "  For both Steam versions of the game: the current one (build 11636119)" \
+	  "  and the dx11_non-rt beta (build 11055033). After switching between them" \
+	  "  in Steam, delete $(ORIG).dll - the other version's - and do" \
+	  "  steps 2 and 3 again: Steam puts that version's own $(NAME).dll in" \
+	  "  place of the mod's." \
+	  "" \
 	  "UNINSTALL" \
 	  "  Delete $(NAME).dll and rename $(ORIG).dll back to $(NAME).dll." \
+	  "" \
+	  "IF IT DOES NOT WORK" \
+	  "  The mod says why, in a message box as the game starts or in the panel" \
+	  "  (F7). The usual fix: delete $(ORIG).dll, verify the game" \
+	  "  files in Steam (Properties > Installed Files > Verify integrity of game" \
+	  "  files), then steps 2 and 3 again. Otherwise send $(PROJECT).log and" \
+	  "  $(PROJECT).prev.log from the game's folder." \
+	  "" \
+	  "  On the dx11_non-rt beta the log lists 367 Steam functions the game's" \
+	  "  own $(NAME).dll lacks: none the game uses, so nothing is wrong." \
 	  "" \
 	  "USE" \
 	  "  Pause the game (Esc / Start): a panel appears beside the pause menu with" \

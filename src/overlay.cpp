@@ -1430,7 +1430,9 @@ void draw_panel() {
     ImGui::Separator();
   }
   if (!re::ready()) {
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
     ImGui::TextColored(kOrange, "Game hooks: %s", re::status());
+    ImGui::PopTextWrapPos();
     ImGui::End();
     return;
   }
@@ -1651,7 +1653,9 @@ void install_early() {
     InitializeCriticalSection(&g_cursor_cs);
     g_imgui_cs_ready = true;
   }
-  if (config::get().disable_cursor || config::get().disable_overlay) return;
+  if (config::get().disable_overlay) return;
+  d3d::install_early();
+  if (config::get().disable_cursor) return;
   if (void* prev = mem::iat_hook(GetModuleHandleA(nullptr), "USER32.dll", "ClipCursor",
                                  reinterpret_cast<void*>(&hk_clip_cursor), &g_clip_slot)) {
     g_real_clip = reinterpret_cast<ClipCursorFn>(prev);

@@ -5,10 +5,11 @@
 // The Dear ImGui panel and the machinery that gets it on screen. RE2 renders
 // through Direct3D 11 or 12 (its own option), and both present through a DXGI
 // swap chain - DXVK's under Proton, dxgi.dll's on Windows, one class for both
-// APIs - so the panel hooks that class's Present, Present1 and ResizeBuffers
-// through the vtable of a throwaway swap chain of our own, and draws with the
-// DX11 or the DX12 backend depending on which device the game's swap chain
-// belongs to.
+// APIs - so the panel hooks Present, Present1 and ResizeBuffers of the game's
+// own swap chain, taken as its factory makes it and given a vtable of its own
+// (or, failing that, in the class's vtable through a throwaway swap chain), and
+// draws with the DX11 or the DX12 backend depending on which device the game's
+// swap chain belongs to.
 namespace re2cc::overlay {
 
 void install_early();  // from DllMain: the locks, and re2.exe's ClipCursor import
@@ -39,7 +40,10 @@ bool capturing_keyboard();  // a panel field has keyboard focus
 bool visible();             // the panel was drawn in the last frame
 
 namespace d3d {  // overlay_d3d.cpp
-bool install();
+void install_early();  // DllMain: re2.exe's CreateDXGIFactory imports, so the game's swap chains are adopted as they are made
+bool adopting();       // those hooks are in
+bool presenting();     // the game's swap chain has presented through the mod
+bool install();        // the fallback: the swap chain class's vtable, through a throwaway swap chain
 void uninstall();
 void service();
 void log_rates();  // mod thread, once a second

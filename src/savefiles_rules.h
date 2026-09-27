@@ -119,6 +119,41 @@ inline int32_t getter_offset(const uint8_t* b, size_t n, bool wide) {
   return -1;
 }
 
+// The dx11_non-rt build's text getters (SaveFileDetail.get_Title and the rest) keep
+// the text as the engine's own UTF-16 string and make a managed one of it each call:
+//   add rdx,OFF; lea rcx,[rsp+T]; call copy;   (the detail's string copied to rsp+T)
+//   cmp dword [rsp+C],INLINE; lea r8,[rsp+T]; mov edx,[rsp+L]; ...; cmovae r8,[rsp+T]
+// - its characters inline at +0 while the capacity (+C-T) is below INLINE, else a
+// pointer there; the length (+L-T) in characters. Build 11055033: OFF 0x18/0x38/0x58,
+// capacity +0x1C, length +0x18, inline below 12.
+struct NativeText {
+  int32_t offset = -1, length = -1, capacity = -1, inline_below = -1;
+};
+inline bool native_text_getter(const uint8_t* b, size_t n, NativeText* out) {
+  for (size_t i = 0; i + 14 <= n; ++i) {
+    // add rdx,imm8; lea rcx,[rsp+d8]; call rel32
+    if (!(b[i] == 0x48 && b[i + 1] == 0x83 && b[i + 2] == 0xC2 && b[i + 4] == 0x48 && b[i + 5] == 0x8D &&
+          b[i + 6] == 0x4C && b[i + 7] == 0x24 && b[i + 9] == 0xE8))
+      continue;
+    NativeText t;
+    t.offset = static_cast<int8_t>(b[i + 3]);
+    const int temp = b[i + 8];
+    for (size_t j = i + 14; j + 4 <= n; ++j) {
+      if (b[j] == 0x83 && b[j + 1] == 0x7C && b[j + 2] == 0x24 && t.capacity < 0) {  // cmp dword [rsp+d8],imm8
+        t.capacity = b[j + 3] - temp;
+        t.inline_below = b[j + 4];
+      }
+      if (b[j] == 0x8B && b[j + 1] == 0x54 && b[j + 2] == 0x24 && t.length < 0) t.length = b[j + 3] - temp;  // mov edx,[rsp+d8]
+    }
+    if (t.offset > 0 && t.capacity >= 0 && t.length >= 0 && t.inline_below > 0) {
+      *out = t;
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 // `B8 imm32 C3` - `mov eax,imm32; ret`: a getter returning a constant.
 inline bool getter_constant(const uint8_t* b, size_t n, int32_t* out) {
   if (n < 6 || b[0] != 0xB8 || b[5] != 0xC3) return false;

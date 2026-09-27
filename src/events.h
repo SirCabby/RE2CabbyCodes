@@ -31,6 +31,11 @@ namespace re2cc::events {
 
 void install();    // mod thread, right after game::discover(): the database entries; logs each
 void service();    // mod thread, every second: vtable slots as classes come up; first calls to the log
+// A vtable hook the game copies into a delegate as it makes it, still waiting for
+// its class: the mod thread then services every 100 ms rather than every second.
+// Only God mode's in the dx11_non-rt build - read into the player's delegates as it
+// starts, so they have to be in before a player is.
+bool pending();
 bool ready(cheats::Kind k);           // the cheat's events are hooked (it works)
 bool records_screen_hooked(int set);  // records::Set: the mod hears that records screen's frames
 bool load_screen_hooked();            // the mod hears the Load Game screen's frames (the save files)

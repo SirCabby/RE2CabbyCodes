@@ -108,6 +108,18 @@ struct Code {
   int32_t first = -1, count = 0;
   uintptr_t set_details = 0;  // SaveLoadBaseBehavior.set_SaveFileDetailList: a reference store the VM counts
   uintptr_t refresh = 0;      // SaveService.updateSaveFileDetailTbl(via.UserIndex), static
+  // The dx11_non-rt build has no updateSaveFileDetailTbl. What it does in the current
+  // build - the native service's "fresh" counter to -1, then the native refresh - is
+  // done there as two writes: that counter, and SaveDataManager.<LastDetailUserIndex>
+  // to -1, so the game's own getSaveFileDetailList calls the refresh the next time the
+  // screen asks for the list. Both read out of getSaveFileDetailList's code.
+  uintptr_t service_slot = 0;  // the global holding the native save service
+  int32_t fresh_off = -1;      // its counter (+0x74 in build 11055033)
+  // The dx11_non-rt build keeps the three texts as the engine's own UTF-16 strings,
+  // not managed ones (savefiles_rules.h, native_text_getter): title/subtitle/detail
+  // are then where those sit, laid out as `native`.
+  bool native_texts = false;
+  rules::NativeText native;
 };
 Code C;
 std::atomic<bool> g_code_ok{false};
@@ -116,6 +128,16 @@ std::atomic<bool> g_code_ok{false};
 // (the original steam_api64.dll's flat functions).
 struct Steam {
   void* (*storage)() = nullptr;  // SteamAPI_SteamRemoteStorage_v014
+  // The dx11_non-rt build ships a Steam DLL of 2016, with the same flat functions but
+  // no accessor: there the interface comes from the client, as the old SDK's headers
+  // got it - SteamAPI_ISteamClient_GetISteamRemoteStorage(SteamClient(), the user,
+  // the pipe, the version the game itself asks for: its STEAMREMOTESTORAGE_INTERFACE_
+  // VERSION string, 013 in build 11055033, the one that DLL's functions are built for).
+  void* (*client)() = nullptr;             // SteamClient
+  int32_t (*user)() = nullptr;             // SteamAPI_GetHSteamUser
+  int32_t (*pipe)() = nullptr;             // SteamAPI_GetHSteamPipe
+  void* (*client_storage)(void*, int32_t, int32_t, const char*) = nullptr;  // SteamAPI_ISteamClient_GetISteamRemoteStorage
+  char version[64] = "";
   bool (*write)(void*, const char*, const void*, int32_t) = nullptr;
   int32_t (*read)(void*, const char*, void*, int32_t) = nullptr;
   bool (*remove)(void*, const char*) = nullptr;
@@ -217,6 +239,17 @@ bool getter_constant(uintptr_t code, int32_t* out) {
   return code && mem::copy_from(b, code, sizeof(b)) && rules::getter_constant(b, sizeof(b), out);
 }
 
+// A text getter: a managed string's reference at +off (the current build), or the
+// engine's own UTF-16 string at +off (the dx11_non-rt build: `native` filled).
+int32_t text_offset(uintptr_t code, rules::NativeText* native, bool* is_native) {
+  const int32_t off = getter_offset(code, true);
+  if (off > 0 || !code) return off;
+  uint8_t b[64] = {};
+  if (!mem::copy_from(b, code, sizeof(b)) || !rules::native_text_getter(b, sizeof(b), native)) return -1;
+  *is_native = true;
+  return native->offset;
+}
+
 int32_t chars_offset(uintptr_t code) {
   uint8_t b[48] = {};
   return code && mem::copy_from(b, code, sizeof(b)) ? rules::chars_offset(b, sizeof(b)) : -1;
@@ -235,6 +268,33 @@ bool eval_list(uintptr_t fn, bool with_offset, int32_t* out) {
                    with_offset ? 8 : -1, 0);
 }
 
+// The dx11_non-rt build's list refresh (Code::service_slot, fresh_off), out of
+// SaveDataManager.getSaveFileDetailList's code: `mov rcx,[rip+service]; mov edx,eax;
+// call refresh` (made when the current user is not <LastDetailUserIndex>), and in that
+// native refresh the counter it compares and stores - `cmp esi,[rbx+off] ... mov
+// [rbx+off],esi` - its "the table is fresh" test.
+void find_list_refresh(Code* c) {
+  const HMODULE exe = GetModuleHandleA(nullptr);
+  const mem::Range text = mem::section(exe, ".text"), data = mem::section(exe, ".data");
+  const char* const kMode = "app.ropeway.gamemastering.SaveDataManager.SaveMode";
+  const uintptr_t list = S.mgr ? re::method_code_typed(S.mgr, "getSaveFileDetailList", {kMode}) : 0;
+  for (uintptr_t p = list; list && p < list + 0x100 && !c->service_slot; ++p) {
+    if (!mem::matches(p, "48 8B 0D ?? ?? ?? ?? 8B D0 E8")) continue;
+    const uintptr_t slot = mem::rip_target(p, 3, 7), refresh = mem::rip_target(p + 9, 1, 5);
+    if (!data.contains(slot) || !text.contains(refresh)) continue;
+    for (uintptr_t q = refresh; q < refresh + 0x100 && c->fresh_off < 0; ++q) {
+      if (!mem::matches(q, "3B 73 ??")) continue;
+      const uint8_t off = mem::read<uint8_t>(q + 2);
+      for (uintptr_t r = q + 3; r < q + 0x60; ++r)
+        if (mem::matches(r, "89 73 ??") && mem::read<uint8_t>(r + 2) == off) {
+          c->fresh_off = off;
+          c->service_slot = slot;
+          break;
+        }
+    }
+  }
+}
+
 // Everything the mod reads out of the game's code, into a copy, published at
 // once. The classes are found by name at start-up; their code is the runtime's
 // to link, and the engine's own via.* classes are the first the mod reads code
@@ -243,13 +303,22 @@ bool resolve_code(bool log_failure) {
   Code c;
   auto getter = [](const char* name) { return T.detail ? re::method_code(T.detail, name, 0) : 0; };
   c.slot = getter_offset(getter("get_Slot"), false);
-  c.title = getter_offset(getter("get_Title"), true);
-  c.subtitle = getter_offset(getter("get_SubTitle"), true);
-  c.detail = getter_offset(getter("get_Detail"), true);
+  bool native[3] = {};
+  rules::NativeText layout3[3];
+  c.title = text_offset(getter("get_Title"), &layout3[0], &native[0]);
+  c.subtitle = text_offset(getter("get_SubTitle"), &layout3[1], &native[1]);
+  c.detail = text_offset(getter("get_Detail"), &layout3[2], &native[2]);
+  // All three one kind; native ones laid out alike.
+  const bool same_kind = native[0] == native[1] && native[1] == native[2] &&
+                         (!native[0] || (layout3[0].length == layout3[1].length && layout3[1].length == layout3[2].length &&
+                                         layout3[0].capacity == layout3[2].capacity &&
+                                         layout3[0].inline_below == layout3[2].inline_below));
+  c.native_texts = native[0];
+  c.native = layout3[0];
   c.stamp = getter_offset(getter("get_LastUpdateTimeStamp"), true);
   c.use_size = getter_offset(getter("get_UseSize"), true);
   const bool invalid = getter_constant(getter("get_InvalidSlot"), &c.invalid_slot);
-  const bool details = c.slot > 0 && c.title > 0 && c.subtitle > 0 && c.detail > 0 && c.stamp > 0 && invalid;
+  const bool details = c.slot > 0 && c.title > 0 && c.subtitle > 0 && c.detail > 0 && c.stamp > 0 && invalid && same_kind;
   c.length = getter_offset(T.string ? re::method_code(T.string, "get_Length", 0) : 0, false);
   c.chars = chars_offset(T.string ? re::method_code_typed(T.string, "get_Chars", {"System.Int32"}) : 0);
   const bool strings = c.length > 0 && c.chars > 0;
@@ -261,16 +330,25 @@ bool resolve_code(bool log_failure) {
   c.set_details = re::method_code_typed(Scr.base, "set_SaveFileDetailList",
                                         {"System.Collections.Generic.List`1<via.storage.saveService.SaveFileDetail>"});
   c.refresh = g_service ? re::method_code_typed(g_service, "updateSaveFileDetailTbl", {"via.UserIndex"}, true) : 0;
-  const bool ok = details && strings && layout && c.set_details && c.refresh;
+  if (!c.refresh) find_list_refresh(&c);
+  const bool ok = details && strings && layout && c.set_details && (c.refresh || (c.service_slot && c.fresh_off > 0));
   const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
   auto rva = [base](uintptr_t a) { return a > base ? static_cast<unsigned long long>(a - base) : 0ull; };
-  if (ok || log_failure)
-    logf("save files: %s: details %d (slot +0x%X, strings +0x%X/+0x%X/+0x%X, stamp +0x%X, size +0x%X, empty = 0x%X), "
-         "strings %d (+0x%X/+0x%X), the main game's list %d (slots %d-%d), set_SaveFileDetailList exe+0x%llX, "
-         "SaveService.updateSaveFileDetailTbl exe+0x%llX",
+  if (ok || log_failure) {
+    char how[128];
+    if (c.refresh) std::snprintf(how, sizeof(how), "SaveService.updateSaveFileDetailTbl exe+0x%llX", rva(c.refresh));
+    else std::snprintf(how, sizeof(how), "the list re-read by field writes (the save service at [exe+0x%llX], its counter +0x%X)",
+                       rva(c.service_slot), static_cast<uint32_t>(c.fresh_off));
+    char kind[96] = "";
+    if (c.native_texts)
+      std::snprintf(kind, sizeof(kind), " (the engine's own UTF-16: length +0x%X, capacity +0x%X, inline below %d)",
+                    static_cast<uint32_t>(c.native.length), static_cast<uint32_t>(c.native.capacity), c.native.inline_below);
+    logf("save files: %s: details %d (slot +0x%X, strings +0x%X/+0x%X/+0x%X%s, stamp +0x%X, size +0x%X (-1: none), empty = 0x%X), "
+         "strings %d (+0x%X/+0x%X), the main game's list %d (slots %d-%d), set_SaveFileDetailList exe+0x%llX, %s",
          ok ? "the game's code read" : "ERROR: the game's code not understood after a minute (still trying)", details,
-         c.slot, c.title, c.subtitle, c.detail, c.stamp, c.use_size, static_cast<uint32_t>(c.invalid_slot), strings,
-         c.length, c.chars, layout, c.first, c.first + c.count - 1, rva(c.set_details), rva(c.refresh));
+         c.slot, c.title, c.subtitle, c.detail, kind, c.stamp, c.use_size, static_cast<uint32_t>(c.invalid_slot), strings,
+         c.length, c.chars, layout, c.first, c.first + c.count - 1, rva(c.set_details), how);
+  }
   if (!ok) return false;
   C = c;
   set_status("");
@@ -312,6 +390,37 @@ bool read_string(uintptr_t s, char* out, size_t n) {
   return true;
 }
 
+// The engine's own UTF-16 string at `at` (the dx11_non-rt build's detail texts,
+// C.native): its characters inline while its capacity is below the inline size,
+// else behind a pointer in the same place.
+bool read_native_text(uintptr_t at, char* out, size_t n) {
+  if (n) out[0] = '\0';
+  int32_t len = 0, cap = 0;
+  if (!mem::read_safe(at + static_cast<uintptr_t>(C.native.length), &len) ||
+      !mem::read_safe(at + static_cast<uintptr_t>(C.native.capacity), &cap) || len < 0 || len > 4096 || cap < len)
+    return false;
+  const uintptr_t chars = cap >= C.native.inline_below ? mem::read_ptr(at) : at;
+  wchar_t w[512];
+  const int take = len < 511 ? len : 511;
+  if (take && (!chars || !mem::copy_from(w, chars, static_cast<size_t>(take) * 2))) return false;
+  char u[1600];
+  const int got = take ? WideCharToMultiByte(CP_UTF8, 0, w, take, u, sizeof(u) - 1, nullptr, nullptr) : 0;
+  size_t m = got > 0 ? static_cast<size_t>(got) : 0;
+  if (m >= n) {
+    m = n - 1;
+    while (m > 0 && (static_cast<uint8_t>(u[m]) & 0xC0) == 0x80) --m;  // not inside a character
+  }
+  std::memcpy(out, u, m);
+  out[m] = '\0';
+  return true;
+}
+
+// A detail's text at +off, whichever kind the build keeps.
+bool read_detail_text(uintptr_t detail, int32_t off, char* out, size_t n) {
+  return C.native_texts ? read_native_text(detail + static_cast<uintptr_t>(off), out, n)
+                        : read_string(mem::read_ptr(detail + static_cast<uintptr_t>(off)), out, n);
+}
+
 // One row of the list (slot `slot`): the engine's detail of the slot (null: no
 // save) and the strings the game's row shows. false: the entry is not what the
 // list is made of - not a SaveFileDetail, or a detail of another slot.
@@ -327,9 +436,9 @@ bool read_row(uintptr_t detail, uintptr_t texts, int slot, Row* r) {
   char title[256] = {}, detail_text[512] = {};
   long long stamp = 0, size = -1;
   if (r->used) {
-    read_string(mem::read_ptr(detail + static_cast<uintptr_t>(C.title)), title, sizeof(title));
-    read_string(mem::read_ptr(detail + static_cast<uintptr_t>(C.subtitle)), r->subtitle, sizeof(r->subtitle));
-    read_string(mem::read_ptr(detail + static_cast<uintptr_t>(C.detail)), detail_text, sizeof(detail_text));
+    read_detail_text(detail, C.title, title, sizeof(title));
+    read_detail_text(detail, C.subtitle, r->subtitle, sizeof(r->subtitle));
+    read_detail_text(detail, C.detail, detail_text, sizeof(detail_text));
     mem::read_safe(detail + static_cast<uintptr_t>(C.stamp), &stamp);
     if (C.use_size >= 0) mem::read_safe(detail + static_cast<uintptr_t>(C.use_size), &size);
     r->unix_time = rules::unix_seconds(stamp);
@@ -406,17 +515,32 @@ void snapshot(uintptr_t list, uintptr_t texts) {
   LeaveCriticalSection(&g_cs);
 }
 
+uintptr_t save_manager();
+
 // The engine's table of the slots read again, and the screen's list dropped so
 // its own update reads the table again and rebuilds its rows. From the hook: the
 // screen's own thread, inside the game's frame (ctx is the hook's).
 void refresh(uintptr_t ctx, uintptr_t screen) {
-  if (!C.set_details || !C.refresh) {
+  if (!C.set_details || (!C.refresh && (!C.service_slot || C.fresh_off <= 0))) {
     g_refresh_broken = true;
     logf("ERROR: save files: the refresh calls are not there - no more refreshes this session");
     return;
   }
   const int user = g_refresh_user.load();
-  if (user >= 0 && user < g_user_count) {
+  if (!C.refresh) {
+    // The dx11_non-rt build: the table marked stale, and the manager's last user
+    // forgotten, so its getSaveFileDetailList - asked by the screen, once its list is
+    // dropped below - calls the native refresh with the current user, and it re-reads.
+    const uintptr_t sdm = save_manager();
+    const uintptr_t service = mem::read_ptr(C.service_slot);
+    const uintptr_t user_at = sdm ? re::field_addr(sdm, S.f_user) : 0;
+    if (!service || !user_at || !mem::store<int32_t>(service + static_cast<uintptr_t>(C.fresh_off), -1) ||
+        !mem::store<int32_t>(user_at, -1)) {
+      g_refresh_broken = true;
+      logf("ERROR: save files: the save service or the save manager could not be written - no more refreshes this session");
+      return;
+    }
+  } else if (user >= 0 && user < g_user_count) {
     reinterpret_cast<void (*)(uintptr_t, int32_t)>(C.refresh)(ctx, user);
     if (call::exception_pending(ctx)) {
       g_refresh_broken = true;
@@ -435,9 +559,13 @@ void refresh(uintptr_t ctx, uintptr_t screen) {
   g_refresh_want = false;
   g_refreshed = GetTickCount() | 1;
   g_snap_want = true;
-  logf("save files: the game's list is being read again (SaveService.updateSaveFileDetailTbl(User%d), the screen's "
-       "list dropped)",
-       user);
+  if (C.refresh)
+    logf("save files: the game's list is being read again (SaveService.updateSaveFileDetailTbl(User%d), the screen's "
+         "list dropped)",
+         user);
+  else
+    logf("save files: the game's list is being read again (the save service's table marked stale, the manager's "
+         "last user forgotten, the screen's list dropped)");
 }
 
 // --- the game's saves ----------------------------------------------------------------------------------------
@@ -574,6 +702,10 @@ void run_copy(Job* j) {
   slot_name(j->from_slot, a, sizeof(a));
   slot_name(j->to_slot, b, sizeof(b));
   void* rs = St.storage ? St.storage() : nullptr;
+  if (!rs && St.client_storage && St.client) {
+    void* client = St.client();
+    rs = client ? St.client_storage(client, St.user(), St.pipe(), St.version) : nullptr;
+  }
   if (!rs) return job_fail(j, "Steam's remote storage is not available - nothing was changed.");
   // Steam's files, beside the game's list: the names must be the game's.
   auto files = std::make_unique<rules::SteamFiles>();
@@ -925,7 +1057,9 @@ bool discover() {
   if (const uint32_t e = re::find_type("app.ropeway.gamemastering.SaveDataManager.SaveLoadStep")) {
     S.idle[0] = re::enum_value(e, "INITIALIZE", S.idle[0]);
     S.idle[1] = re::enum_value(e, "REQUEST_WAIT", S.idle[1]);
-    S.idle[2] = re::enum_value(e, "PS5_CROSSSAVE_DIALOG", S.idle[2]);
+    // The dx11_non-rt build has no PS5 steps: there only the first two are idle
+    // (its get_IsBusy: SAVE_WAIT, LOAD_WAIT, REMOVE_DATA_WAIT and the errors from 5 are busy).
+    S.idle[2] = re::enum_value(e, "PS5_CROSSSAVE_DIALOG", S.idle[1]);
   }
   const char* const kMode = "app.ropeway.gamemastering.SaveDataManager.SaveMode";
   const bool layout = S.mgr && re::find_method(S.mgr, "getSaveDataIndex", {kMode, "System.Int32"}, true) &&
@@ -937,16 +1071,44 @@ bool discover() {
   S.ok = S.mgr && S.inst.valid() && S.f_save.valid() && S.f_load.valid() && S.f_remove.valid() &&
          S.f_remove_all.valid() && S.f_slot.valid() && S.f_step.valid() && S.f_user.valid() && mode && layout;
   g_service = need_type("via.storage.saveService.SaveService");
-  if (g_service && !re::find_method(g_service, "updateSaveFileDetailTbl", {"via.UserIndex"}, true)) {
-    logf("save files: SaveService.updateSaveFileDetailTbl(UserIndex) not found");
-    ++g_missing;
-  }
+  // Not in the dx11_non-rt build: there the list is re-read by field writes (find_list_refresh).
+  if (g_service && !re::find_method(g_service, "updateSaveFileDetailTbl", {"via.UserIndex"}, true))
+    logf("save files: SaveService.updateSaveFileDetailTbl(UserIndex) is not in this build - the game's list is read "
+         "again by field writes (SaveDataManager.getSaveFileDetailList's own refresh)");
   if (const uint32_t u = re::find_type("via.UserIndex")) g_user_count = re::enum_value(u, "Reserved", g_user_count);
 
   // Steam's remote storage: the original DLL's flat API.
   if (HMODULE orig = proxy::original()) {
     auto fn = [orig](const char* name) { return reinterpret_cast<void*>(GetProcAddress(orig, name)); };
     St.storage = reinterpret_cast<decltype(St.storage)>(fn("SteamAPI_SteamRemoteStorage_v014"));
+    if (!St.storage) {
+      St.client = reinterpret_cast<decltype(St.client)>(fn("SteamClient"));
+      St.user = reinterpret_cast<decltype(St.user)>(fn("SteamAPI_GetHSteamUser"));
+      St.pipe = reinterpret_cast<decltype(St.pipe)>(fn("SteamAPI_GetHSteamPipe"));
+      St.client_storage = reinterpret_cast<decltype(St.client_storage)>(fn("SteamAPI_ISteamClient_GetISteamRemoteStorage"));
+      // The version the game asks for, out of its own strings (.rdata).
+      const mem::Range rdata = mem::section(GetModuleHandleA(nullptr), ".rdata");
+      static const char kVersion[] = "STEAMREMOTESTORAGE_INTERFACE_VERSION";
+      for (uintptr_t a = rdata.begin; rdata.size() > 64 && a + sizeof(kVersion) + 4 < rdata.end && !St.version[0];) {
+        const void* hit = std::memchr(reinterpret_cast<const void*>(a), 'S', rdata.end - a - sizeof(kVersion) - 4);
+        if (!hit) break;
+        a = reinterpret_cast<uintptr_t>(hit);
+        if (std::memcmp(hit, kVersion, sizeof(kVersion) - 1) == 0) {
+          const char* v = static_cast<const char*>(hit);
+          size_t n = 0;
+          while (n < sizeof(St.version) - 1 && v[n] > ' ' && v[n] < 0x7F) ++n;
+          std::memcpy(St.version, v, n);
+          St.version[n] = '\0';
+        }
+        ++a;
+      }
+      if (!(St.client && St.user && St.pipe && St.client_storage && St.version[0]))
+        St.client = nullptr, St.client_storage = nullptr;
+      else
+        logf("save files: the original steam_api64.dll has no SteamAPI_SteamRemoteStorage_v014 (an older Steam SDK): "
+             "the remote storage comes from its client (%s)",
+             St.version);
+    }
     St.write = reinterpret_cast<decltype(St.write)>(fn("SteamAPI_ISteamRemoteStorage_FileWrite"));
     St.read = reinterpret_cast<decltype(St.read)>(fn("SteamAPI_ISteamRemoteStorage_FileRead"));
     St.remove = reinterpret_cast<decltype(St.remove)>(fn("SteamAPI_ISteamRemoteStorage_FileDelete"));
@@ -954,7 +1116,7 @@ bool discover() {
     St.count = reinterpret_cast<decltype(St.count)>(fn("SteamAPI_ISteamRemoteStorage_GetFileCount"));
     St.name_and_size = reinterpret_cast<decltype(St.name_and_size)>(fn("SteamAPI_ISteamRemoteStorage_GetFileNameAndSize"));
   }
-  St.ok = St.storage && St.write && St.read && St.remove && St.size && St.count && St.name_and_size;
+  St.ok = (St.storage || St.client_storage) && St.write && St.read && St.remove && St.size && St.count && St.name_and_size;
   if (!St.ok) logf("save files: Steam's remote storage functions not found in the original steam_api64.dll - no Copy");
 
   const bool names = Scr.ok && S.ok && g_missing == 0;

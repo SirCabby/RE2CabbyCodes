@@ -45,6 +45,8 @@ Both ask first and change your saves straight away, so neither can be undone. Th
 
 [size=5][b]Install[/b][/size]
 
+[b]Works with both Steam versions of the game[/b]: the current one (the default branch, build 11636119, with ray tracing) and the older one without ray tracing (the [b]dx11_non-rt[/b] beta in the game's Properties > Betas, build 11055033). Switching between them in Steam replaces the game's steam_api64.dll - the mod's included - so after a switch delete steam_api64_orig.dll (the other version's) and do both steps again.
+
 Copy into the game's folder - the one with re2.exe (in Steam: right-click the game > Manage > Browse local files):
 [list=1]
 [*]Rename the stock [b]steam_api64.dll[/b] to [b]steam_api64_orig.dll[/b]
@@ -55,7 +57,20 @@ That is the whole install, on [b]Windows and Linux/Proton alike[/b] - no launch 
 
 To uninstall: delete steam_api64.dll and rename steam_api64_orig.dll back.
 
-[b]Steam's "Verify integrity of game files" removes the mod[/b] by restoring the stock DLL. Just re-copy the file. If the game stops with [b]steam_api64_orig.dll is missing or broken[/b], the rename was skipped: verify the game files in Steam (that brings the stock DLL back), then do both steps again.
+[b]Steam's "Verify integrity of game files" removes the mod[/b] by restoring the stock DLL. Just re-copy the file.
+
+[size=4][b]If it does not work[/b][/size]
+The mod says what is wrong - in a message box as the game starts, or in the panel (F7):
+[list]
+[*][b]The game's own Steam DLL is missing[/b] - there is no steam_api64_orig.dll: the rename was skipped, or the mod's DLL was copied over the game's. In Steam, right-click the game > Properties > Installed Files > Verify integrity of game files (that brings the game's steam_api64.dll back), then do both steps again.
+[*][b]steam_api64_orig.dll is not the game's own Steam DLL[/b] - the file you renamed is not the one the game came with (another game's, or another version's), and the game cannot run with it. Delete steam_api64_orig.dll first - verifying the game files leaves it where it is, and a rename cannot replace it - then the same fix: verify the game files, and both steps again.
+[*][b]RE2CabbyCodes does not work with this version of Resident Evil 2[/b], or in the panel [b]a version of the game the mod was not made for[/b] - neither of the two versions above (a future update, say). Set Betas to None, or uninstall the mod.
+[/list]
+[b]On the dx11_non-rt beta[/b], the log lists 367 Steam functions the game's own steam_api64.dll lacks: it is an older Steam DLL than the current version's, and the game uses none of them. Versions 1.0.1 and 1.0.2 of the mod log that as "steam_api64_orig.dll is not the Steam DLL the mod was made for" - with the beta's own DLL, that line is expected and nothing is wrong.
+
+[b]With REFramework on Windows[/b], versions 1.0.3 to 1.0.5 of the mod kept REFramework from ever seeing a frame of the game: its menu never came up, no REFramework mod or plugin worked, and its log (re2_framework_log.txt) repeats "Last chance encountered for hooking" every 11 seconds. This version leaves REFramework's way of finding the game's frames alone.
+
+For anything else, attach [b]RE2CabbyCodes.log[/b] and [b]RE2CabbyCodes.prev.log[/b] from the game's folder - the files themselves, not a summary.
 
 [size=5][b]Please read before using[/b][/size]
 [list]
@@ -66,7 +81,7 @@ To uninstall: delete steam_api64.dll and rename steam_api64_orig.dll back.
 [*]God mode heals every hit, but an attack that kills outright - a blow worth more than all your health, or being eaten - still does.
 [*]One hit kills changes boss fights: a boss whose fight is scripted around its health may end sooner. A few special hits (G2 clinging on, some breakable enemy parts) still do their normal damage.
 [*]The inventory and the item box are the game's own: a change is kept by your next save and lost, like anything else, if you quit without saving - an item thrown away is gone for good once you save. They change only while the pause menu is up, and a change the mod cannot make safely is refused, with the reason in the panel.
-[*]Only the current Steam build (11636119, June 2023) has been looked at. Everything the mod uses is found by name in the game's own type information, so in a build where something is missing, that feature is greyed out with the reason beside it, and the log says what was missing.
+[*]Two Steam builds have been looked at: the current one (11636119, June 2023) and the dx11_non-rt beta (11055033, April 2023). Everything the mod uses is found by name in the game's own type information, so in a build where something is missing, that feature is greyed out with the reason beside it, and the log says what was missing. On the dx11_non-rt version the save files' panel shows no file sizes, and three cheats (One hit kills, Save without ink ribbons, Infinite wooden boards) are heard at other points of the game's code than on the current version - report anything odd with the log.
 [*]Tested on Linux/Proton.
 [/list]
 

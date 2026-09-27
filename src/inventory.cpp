@@ -169,6 +169,43 @@ const char* name_of(const game::Item& it) {
   return item_name(it, buf, sizeof(buf));
 }
 
+// A weapon the editor made before 2026-09-25 recorded no ammo type: its BulletId
+// is 0, because the lookup of EquipmentDefine.getItemID - a static method - was
+// made as for an instance method and found nothing. The game's reload begins
+// with that field (Inventory.getReloadableBulletMainSlot answers 0 rounds for a
+// BulletId of 0 whatever the player carries), so such a weapon could never be
+// reloaded. Each one, in a slot or in the item box, is given the ammo the game's
+// own data names for it - the value the editor now writes as it makes one, into
+// the stock that already exists (a field write, like a count). Only the exact
+// mistake is touched: a weapon with no ammo type whose data names one kind of
+// ammo, singly. A weapon that takes none (a knife, a grenade, the infinite
+// weapons) names none, one that takes two kinds of rounds names no single item
+// (the game picks for those), and anything with an ammo type already is left
+// alone. The game tick, while the pause menu is up.
+int repair_ammo_types(const game::Bag& b, const game::Box* box) {
+  int fixed = 0;
+  auto repair = [&](const game::Stock& s, const char* where, int i) {
+    if (!s.prim || !game::is_weapon(s.item) || s.item.bullet_id != 0) return;
+    const uint32_t kind = game::weapon_bullet_kind(s.item.weapon_id, s.item.parts);
+    const int ammo = game::weapon_bullet_id(s.item.weapon_id, s.item.parts);
+    if (!kind || (kind & (kind - 1)) || ammo <= 0) return;
+    game::Item v = s.item;
+    v.bullet_id = ammo;
+    if (!game::write_item(s, v)) return;
+    ++fixed;
+    char weapon[96], item[96];
+    game::Item of_ammo;
+    of_ammo.item_id = ammo;
+    of_ammo.count = 1;
+    note(false, "%s %d: %s recorded no ammo type (a weapon an earlier build made) - it takes %s again", where, i + 1,
+         item_name(s.item, weapon, sizeof(weapon)), item_name(of_ammo, item, sizeof(item)));
+  };
+  for (int i = 0; i < b.slots && i < game::kMaxSlots; ++i) repair(b.slot[i], "slot", i);
+  if (box)
+    for (int i = 0; i < box->count && i < game::kMaxBox; ++i) repair(box->entry[i], "item box entry", i);
+  return fixed;
+}
+
 // The weapon the editor puts in a slot, filled the way the game fills one
 // (ItemData.setWeapon, what ItemLockerManager.AddWeaponToStrage hands it): the
 // weapon's id, no parts, the rounds asked for and the ammo that weapon takes,
@@ -554,6 +591,10 @@ void tick(bool in_game, bool paused) {
   static game::Box box;
   bool have_bag = in_game && game::read_bag(&bag);
   bool have_box = have_bag && game::read_box(&box);
+  if (open && have_bag && repair_ammo_types(bag, have_box ? &box : nullptr)) {
+    have_bag = game::read_bag(&bag);
+    have_box = have_bag && game::read_box(&box);
+  }
   for (int i = 0; i < nq; ++i) {
     if (!open) {
       note(true, "changes are only made while the pause menu is up");

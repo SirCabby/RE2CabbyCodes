@@ -1,7 +1,8 @@
 # RE2CabbyCodes — project guide
 
 A client-side mod for **Resident Evil 2 (2019)** — Steam app 883710, 64-bit RE Engine `re2.exe`
-(SteamStub-wrapped, build 11636119, Direct3D 11 or 12 by the game's own option) — cross-built on
+(SteamStub-wrapped; build 11636119 and the `dx11_non-rt` beta's build 11055033 — see The dx11_non-rt
+build —, Direct3D 11 or 12 by the game's own option) — cross-built on
 Linux with mingw-w64. It draws a Dear ImGui panel beside the game's **pause menu** with God mode, One
 hit kills, Infinite ammo, No durability loss, Infinite wooden boards, Save without ink ribbons, Save without counting, save-count and play-time
 editors, Freeze play time, Item box without counting, Recovery items without counting, a step-count editor and Freeze step count
@@ -22,7 +23,7 @@ are made from, a few vtable slots).
 
 ```sh
 make            # -> build/steam_api64.dll   (config.mk sets GAME_DIR; gitignored)
-make install    # rename stock steam_api64.dll -> steam_api64_orig.dll (once), deploy ours atomically
+make install    # the live stock steam_api64.dll (a branch switch or a verify puts one back) -> steam_api64_orig.dll, ours deployed atomically
 make uninstall  # restore the stock DLL
 make version X.Y.Z   # set the version;  make package -> dist/RE2CabbyCodes_vX.Y.Z.zip
 make proxy      # regenerate steam_api64.def + src/proxy_exports.inc from the stock DLL's export table
@@ -34,6 +35,8 @@ python3 tools/tdb_dump.py --exe "$GAME_DIR/re2.exe" --type app.ropeway.GameClock
 python3 tools/tdb_dump.py --exe "$GAME_DIR/re2.exe" --enum app.ropeway.gamemastering.Item.ID
 python3 tools/tdb_dump.py --exe "$GAME_DIR/re2.exe" --methods "$GAME_DIR/RE2CabbyCodes.methods.bin" --type app.ropeway.survivor.Inventory
                                                                               # method indices + code RVAs (DumpMethods = 1)
+python3 tools/tdb_dump.py --exe "$GAME_DIR/re2.exe" --link --type app.ropeway.GameClock   # code RVAs with no game running (the link records)
+python3 tools/tdb_dump.py --exe "$GAME_DIR/re2.exe" --write-methods <scratch>/methods.bin     # the same in DumpMethods' format (test_discover)
 python3 tools/pak_msg.py --game "$GAME_DIR" --grep '^ITEM_NAME_70'           # the game's text
 x86_64-w64-mingw32-objdump -d -M intel --start-address=0x140XXXXXX --stop-address=... "$GAME_DIR/re2.exe"
 # tests (Wine, scratch prefix; see Tooling notes):
@@ -49,6 +52,10 @@ x86_64-w64-mingw32-g++ -std=c++20 -O2 -static tests/test_switch.cpp -o tests/bui
 WINEPREFIX=<scratch> wine tests/build/test_switch.exe 'Z:\...\re2.exe'   # src/switch_eval.h on the game's compiled switches
 x86_64-w64-mingw32-g++ -std=c++20 -O2 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -Icontrib/imgui -static tests/test_keyboard.cpp src/keyboard.cpp src/log.cpp src/mem.cpp src/config.cpp contrib/imgui/imgui.cpp contrib/imgui/imgui_draw.cpp contrib/imgui/imgui_tables.cpp contrib/imgui/imgui_widgets.cpp -ldinput8 -ldxguid -luser32 -o tests/build/test_keyboard.exe
 WINEPREFIX=<scratch> wine tests/build/test_keyboard.exe exclusive   # (and `shared`) the panel's keyboard beside a game's; null graphics driver
+x86_64-w64-mingw32-g++ -std=c++20 -O2 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -static tests/test_proxy.cpp src/proxy.cpp src/log.cpp src/mem.cpp -o tests/build/test_proxy.exe
+WINEPREFIX=<scratch> wine tests/build/test_proxy.exe 'Z:\...\re2.exe' 'Z:\...\steam_api64_orig.dll' ['Z:\...\other steam_api64.dll' ...]   # the proxy's checks on real Steam DLLs
+bash -c 'x86_64-w64-mingw32-g++ -std=c++20 -O2 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -Icontrib/imgui -static tests/test_discover.cpp $(ls build/*.o | grep -v dllmain.o) $(find build/imgui -name "*.o") -luser32 -lshell32 -lole32 -lgdi32 -ldwmapi -ldxguid -luuid -ldinput8 -o tests/build/test_discover.exe'
+WINEPREFIX=<scratch> wine tests/build/test_discover.exe 'Z:\...\re2.exe' 'Z:\...\methods.bin'   # the mod's whole start-up over either build's real code, offline
 ```
 
 The log (`RE2CabbyCodes.log`, the run before it in `.prev.log`), the ini (`RE2CabbyCodes.ini`) and the
@@ -120,8 +127,16 @@ fault. Keep them on only for a diagnostic run.
   behaviour whose `updateCountDown` Freeze countdown timer already hooks: it reads the clock itself every
   frame, so the held time goes in for that call (The Ghost Survivors' run timer is the clock itself). The user
   reported the timer still running with the freeze on and chose it over also covering the pause menu's play
-  time, which is not hookable (`PauseBehavior.open` is a direct call). There are no code
-  patches; ask the user before adding any other call or hook.
+  time, which is not hookable (`PauseBehavior.open` is a direct call). An eleventh, 2026-09-24: the
+  **dx11_non-rt build's hook points** (The dx11_non-rt build) - that build makes the delegates the entry
+  hooks rely on from the code itself, so there God mode goes in PlayerCondition's vtable (the same two
+  events, where its delegates read them), One hit kills at `EnemyThinkBehavior.onHitDamage` in every enemy
+  Think class's vtable, Save without ink ribbons at `GimmickTypeWriter.getTriggerFuncCheckValid` (with a
+  write into the delegate it returns), Infinite wooden boards at `TriggerUseItem.checkValid`; and its save
+  files' list is re-read by field writes (the native save service's counter and
+  `SaveDataManager.<LastDetailUserIndex>`), its Copy getting Steam's remote storage from the client. The
+  user's condition: "everything that works in the rt version must continue working" - the RT build keeps
+  its hooks exactly. There are no code patches; ask the user before adding any other call or hook.
 - **Never `VirtualQuery` per read.** Reads and stores of game memory are guarded copies (`src/mem.cpp`: a
   copy loop whose faults a first vectored exception handler turns into `false`; ~2 ns a read, a fault
   ~1.5 µs). Under Wine `NtQueryVirtualMemory` scans the page table to the end of the committed run (~15 µs
@@ -134,7 +149,9 @@ fault. Keep them on only for a diagnostic run.
   editor's weapon picker (2026-09-20, Weapons in the inventory editor below), which builds the weapon
   in an empty **item box** entry (data alone: no model hangs off it) and hands that entry to
   `setStock`. All of them are refused when those calls are unavailable. Only a weapon's loaded rounds
-  are a field write, into the stock the game itself made.
+  are a field write, into the stock the game itself made - and, since 2026-09-25, the ammo type
+  (`BulletId`) of a weapon the editor made with none (Weapons in the inventory editor): a repair of the
+  mod's own mistake, data the game itself rewrites when a weapon's rounds are swapped.
 - Back up `Steam/userdata/<id>/883710/remote/win64_save/` into `.save-backup-<date>/` (gitignored)
   before experiments that write saves.
 - The user commits every repo themselves — do not `git commit`/`push` unless asked.
@@ -150,6 +167,119 @@ table bound. The original (1018 function exports, SDK of 2020-12-20) is proxied 
 `tools/gen_proxy.py` reads its export table (PE32+), checks it covers the 12 names the exe's
 delay-load table asks for, and emits one `jmp [rip+slot]` thunk per function plus a PE forwarder for
 the one data export, `g_pSteamClientGameServer`.
+
+**At run time any Steam DLL will do as the original if it has what the game imports** (`src/proxy.cpp`,
+since 2026-09-23). The proxy reads the names re2.exe asks `steam_api64.dll` for out of its import and
+delay-load tables as it loads (`mem::imported_names`; build 11636119: `SteamAPI_Init`, `_Shutdown`,
+`_RestartAppIfNecessary`, `_IsSteamRunning`, `_RunCallbacks`, `_Register/UnregisterCallback`,
+`_Register/UnregisterCallResult`, `_GetHSteamUser`, `SteamInternal_ContextInit`,
+`SteamInternal_FindOrCreateUserInterface`). A function the original lacks answers 0 (`steam_missing`:
+`xor eax,eax; xorps xmm0,xmm0; ret`) and the log gives the count, the first names and the DLL's size,
+link date and export count (the game's own: 265 504 bytes, 2020-12-20, 1019; SHA-256 `ca1fa9a7...eea73`,
+byte-identical on the Linux and the Windows install). It is fatal only when the game could not run
+anyway: no original (a `steam_api64_orig.dll.dll` - the rename typed with Windows hiding the extension -
+is taken instead), one that will not load, one lacking a function the game imports, or the game importing
+a name the proxy does not export (another version of the game); DllMain then shows `proxy::failure()`, a
+message for the player naming the problem and its fix, and returns FALSE. **Why**: every Steam DLL but
+this exact one lacks some of the 1018 - Valve drops flat functions as it adds new ones: 2017 DLLs lack
+~340 (and `SteamInternal_FindOrCreateUserInterface`), SDK 1.57 (2021) 24, SDK 1.61 (2024) 40 and 2025's
+43 (both also lack `SteamAPI_Init`, which the game needs) - and the first release required all 1018:
+players whose `steam_api64.dll` was not the stock one (another game's, a DLC unlocker's, the dx11_non-rt
+build's if its DLL differs - not checked) got a column of `FATAL: ... lacks export ...` and a game that
+would not start ("missing or broken"). Reported by players 2026-09-23 as "lacks executable".
+
+**The log names the two stock DLLs** (`kStock`, by size, link stamp and export count; since 2026-09-24):
+the current version's (above) and the dx11_non-rt beta's (235 600 bytes, 2016-05-03 - stamp 0x572906D2 -,
+778 exports; SHA-256 `71af8666...f55a8`). The beta's own lacks 367 of the proxy's 1018 and is still the
+right file for the beta, so the log says so (`is the dx11_non-rt beta's own Steam DLL ... the right one for
+that version of the game`); anything else that runs the game is `not a Steam DLL the game ships ... but it
+has every function the game imports`. 1.0.1 and 1.0.2 logged every original short of the 1018 as `is not
+the Steam DLL the mod was made for` - the beta's own included, on every beta run - and a player with the
+right file took that line for the fault (reported 2026-09-24). The line is never a fault: only a `FATAL:`
+line and its message box are. **The fix the message boxes give starts with deleting
+`steam_api64_orig.dll`** when there is one: Steam's verify leaves it alone (not one of the game's files) and
+a rename cannot replace it (Explorer offers `steam_api64_orig (2).dll`), so "verify, then rename again" kept
+the wrong file loaded; README, the BBCode readme and INSTALL.txt say the same, and to delete it after a
+branch switch (the beta's DLL left behind stops the current version: it lacks two of its imports).
+
+**Other versions of the game**: the `dx11_non-rt` beta is supported (next section). A build with neither
+TDB v70 nor v66 - or no `.text`/`.data` - sets `re::unsupported()`: `re::init` says which version it found,
+the mod thread gives up at once and hooks nothing of the game (no events, no frame entries), and the F7
+panel shows the reason.
+
+## The dx11_non-rt build (11055033, TDB 66)
+
+Steam's app info (`appcache/appinfo.vdf` v29, keys through a string table) lists two branches of 883710:
+`public` 11636119 (2023-08-14) and **`dx11_non-rt` 11055033** (2023-04-27) - the game before its 2022
+ray-tracing update (no ray tracing, but it presented through Direct3D 12 in its first run: the branch's
+name notwithstanding), `re2.exe` 123 MB linked 2023-04-19, the same sections (`.bind`: SteamStub). Players use it for older mods; the 1.0.0 reports of "lacks export" came from it. Supported
+since 2026-09-24; what differs, found offline (the build installed on this machine that day):
+
+- **Its Steam DLL**: 235 600 bytes, linked 2016-05-03, 778 exports - it lacks 367 of the proxy's 1018
+  (stubs) and has all 12 the exe imports (`SteamInternal_CreateInterface`, `SteamAPI_GetHSteamPipe` where
+  RT's exe asks for `SteamInternal_FindOrCreateUserInterface`, `SteamInternal_ContextInit`). The RT DLL
+  serves this exe too; RT's exe is refused with this DLL (it lacks those two). A branch switch puts the
+  branch's own `steam_api64.dll` in place of the mod's; `make install` makes whichever stock one is live
+  the original (the one kept from the other branch was the RT DLL).
+- **TDB 66** (`re.cpp`; `tools/tdb_dump.py` class TDB66; REFramework's `tdb66::TDB`, `RETypeDefVersion66`):
+  counts at 0x0C (types, methods, fields, properties, events, ?, params 0x24, **init data 0x28**, ? 0x2C,
+  intern strings, modules, dev/app entry, strings 0x40, bytes 0x44); 13 array offsets from 0x48 (modules,
+  types 0x50, methods 0x58, fields 0x60, properties, events, -, params 0x80, **init data 0x88**, ? 0x90,
+  strings 0x98, bytes 0xA0, intern 0xA8 - REFramework's struct swaps 0x88/0x90; the sizes and the enum
+  literals, `MainState.PAUSE` 9, only read right this way). Records: typedef 0x78 (index, parent, declaring
+  16 bits each in its first qword; name +0x18, namespace +0x1C, object type u8 +0x26, field size +0x2C,
+  `{num:12 first:19}` of methods +0x38, fields +0x3C, properties +0x40; generics +0x50; managed_vt +0x70);
+  field 0x14 (declaring:16 type:16; name +8, flags +0xC, init index +0xE, offset +0x10); method 0x20
+  (declaring:16 vtable index:16 params:8 ?:8 return:16; name +0xC, flags +0x10, impl flags +0x12, params
+  +0x14 - a byte-pool list of 8-byte {type:16 flags:16 name:31} - and **the code +0x18**); generic args
+  `{definition:16 num:16; u16 types[]}`; no impl records. 56 289 types, 378 302 methods, 107 073 fields.
+  The names are RT's but for the few below, and nearly every field offset is the same (`test_re` on both).
+- **Link records** (the loader's per-class code arrays): 0x48 bytes here ({u64 type, u64 ?, vtable
+  {pointer, slots}, code {pointer, count}, 0, 0, global}), 0x28 in RT; 36 324 give 317 583 methods' code.
+  `tools/tdb_dump.py --link` reads them for either build - RT's agree with its in-game DumpMethods file
+  on all 404 279 methods - so this build's code is read with no game running, and `tests/test_discover.cpp`
+  runs the mod's whole discovery over it.
+- **Names and values**: the main state is `<MainStateValue>k__BackingField` +0x84 (RT `_CurrentMainState`
+  +0x8C; `game.cpp` tries both); `gameHeaderSaveData` +0x148; `SaveLoadStep` has no PS5 steps (idle: 0 and
+  1 only; errors from 5); no `SaveService.updateSaveFileDetailTbl`; `SaveFileDetail` has no size getters.
+  Virtual slots move by one here and there (`GameClock.saveGameSaveData` 31 vs 32, `SaveLoadBaseBehavior
+  .update` 14 vs 15, Think `onHitDamage` 43 vs 44): always the database's.
+- **The engine**: the VM global exe+0x70A6820 (the same pattern); via.Application's entry table +0x838,
+  count +0x3EC, 0xD0-byte entries with the same fields (`app.cpp` reads them out of the code); the call
+  bridge's helpers by the same patterns, the same context offsets (+0x78, +0x50, +0x18).
+- **Delegates are made from the code, not the database**: `lea r9,[code]; call` the new-delegate helper
+  (exe+0x1DE4030; a delegate is {count +0x10 = 1, target +0x18, code +0x20}, read out of the helper) - no
+  {&global, method} table (RT has 3 484), no delegate reads a method entry. A virtual method's delegate
+  reads the object's vtable slot as it is made (`mov rax,[obj]; mov rcx,[rax-0x10]; mov r9,[rcx+slot*8]`,
+  `SurvivorCondition.doStart`). So an exchanged entry reaches only what the engine calls by name (its
+  invokers - `Weapon.onHitAttack`, `Equipment.defend`, `RogueCountDownBehavior.updateCountDown`: no
+  reference in the code at all). Per cheat (events.cpp, approved 2026-09-24):
+  - **God mode**: `SurvivorCondition.checkHitDamage` and `PlayerCondition.onHitDamage` in PlayerCondition's
+    vtable (slots 41/40), in before a player starts - serviced every 100 ms while waiting
+    (`events::pending`). The OnChangeHitPoint handler (a `lea` delegate) is not hooked; it never ran in RT.
+  - **One hit kills**: both hit handlers are `lea` delegates. The enemy's handler calls `<Think>.onHitDamage`
+    through the Think's vtable (`call [r9+0x158]`, slot 43) after addDamage and before its `dead()` check:
+    hooked in all 43 Think classes' vtables (17 override it; a `Family` keeps each vtable's own original),
+    where the kill is made after the damage - HP to 0 (`make_lethal_after`), the plant's flame health
+    emptied and its HP kept ≥ 1 (`wither_plant_after`), G2's counter topped up (as in RT) - each before the
+    Think's own onHitDamage. `<IsKill>` is set then too, after the reaction has run.
+  - **Save without ink ribbons**: the lambdas are `lea` delegates made in `getTriggerFuncCheckValid`
+    (virtual 67; also through ITriggerFuncProvider): hooked there, the returned delegate's code pointed at
+    the existing check hooks (a write into that fresh delegate).
+  - **Infinite wooden boards**: the use-item callbacks are `lea` delegates: `TriggerUseItem.checkValid`
+    (virtual 7, before any use: the prompt, the button) marks the trigger's Items/UselessItems boards data.
+- **Records**: `GimmickDialLockManager.SetUnlockRecord` calls setRecordCount (`mov r9d,edi; mov r8d,0x36;
+  mov rcx,rbx; call`, 0x208 bytes in) where RT tail-jumps; the reader finds the `mov r8d,ID` whose call or
+  jump reaches `RecordManager.setRecordCount` (both builds).
+- **Save files**: `getSaveFileDetailList` calls the native refresh (exe+0x24ED100(service, user)) when the
+  user is not `<LastDetailUserIndex>`, and that refresh skips a table it thinks fresh by a counter at
+  service+0x74 (RT +0x2A8, which `updateSaveFileDetailTbl` sets to -1). With no such method, the refresh
+  writes that counter and `<LastDetailUserIndex>` to -1 (both read out of `getSaveFileDetailList`'s code),
+  then `set_SaveFileDetailList(null)` as in RT. `SaveFileDetail`'s texts are the engine's own UTF-16
+  strings at +0x18/+0x38/+0x58 (inline below 12 characters, length +0x18, capacity +0x1C - read out of the
+  getter, `savefiles_rules.h` `native_text_getter`), the stamp +0x78. Copy: the 2016 Steam DLL has no
+  `SteamAPI_SteamRemoteStorage_v014`; the interface comes from `SteamAPI_ISteamClient_GetISteamRemoteStorage(
+  SteamClient(), user, pipe, "STEAMREMOTESTORAGE_INTERFACE_VERSION013")` - the version the exe asks for.
 
 ## What the game does
 
@@ -673,8 +803,11 @@ rewrites them to addresses in place as it starts and **never sets `initialized`*
   `Slot.get_MaxNumber` → `EquipmentManager._WeaponBulletUserdata` (`WeaponBulletUserData`) →
   `_LoadingPartsCombos[]` (`WeaponLoadingpartsCombination` {`_WeaponType`, `_LoadingPartsCombos[]` of
   `LoadingPartsCombination` {`_Priority`, `_Parts`, `_OverwriteNumber`, `_Infinity`, `_Number`}}): among the
-  entries whose parts the weapon has and that overwrite the number, the lowest `_Priority` wins
-  (`WeaponLoadingpartsCombination.getNumber` and its lambdas); `_Infinity` makes it unlimited. Items take their
+  entries whose parts the weapon has and that overwrite the number, the lowest `_Priority` sets it, **and then every
+  entry of a lower priority still that does not overwrite adds its `_Number`** (`WeaponLoadingpartsCombination.getNumber`:
+  two `ForEach` lambdas, exe+0xF65C90 and exe+0xF65D40 - the Matilda's base entry is 12 and its high-capacity
+  magazine's entry adds 12 without overwriting; `game::pick_combo`, `tests/test_slots.cpp`; the mod ran the first
+  pass alone until 2026-09-25); `_Infinity` makes it unlimited. Items take their
   maximum from `ItemManager.getItemMultipleUseMax`; `Slot.RemainingVital` (`inventory.Vital` Fine/Caution/
   Danger/Dead) is the count against that maximum.
 - **Typewriters** (`app.ropeway.gimmick.action.GimmickTypeWriter`) offer the save through triggers
@@ -874,13 +1007,35 @@ rewrites them to addresses in place as it starts and **never sets `initialized`*
     `removeStock`), and a failed `setStock` puts the old stock back through the same entry.
   - **The ammo a weapon records** (`BulletId`): `WeaponBulletUserData.LoadingPartsCombination` has, beside the
     number the durability code reads, **`_OverwriteKind` +0x3C and `_Kind` +0x40** (an `EquipmentDefine.Bullet`,
-    `WeaponLoadingpartsCombination.getKind`), chosen exactly as the number is - lowest `_Priority` among the
-    entries whose parts the weapon has. `EquipmentDefine.getItemID(Bullet)` (static, exe+0x19E5880) turns it into
+    `WeaponLoadingpartsCombination.getKind`), chosen exactly as the number is - the lowest `_Priority` among the
+    entries whose parts the weapon has that overwrites the kind sets it, then every entry below that priority that
+    does not overwrite ORs its `_Kind` in (exe+0x1089280 and exe+0x10892E0; `game::pick_combo`). The game's data
+    (pak entry (1847504892, 2110568308): 42 weapons, 48 entries, 37 of them overwriting the kind - read 2026-09-25
+    with the RSZ reader of `tools/gen_records.py`, base-class fields first) has every base entry overwrite the kind
+    but WP8300-8500's, whose one entry names Handgun without overwriting: the second pass alone gives theirs.
+    `EquipmentDefine.getItemID(Bullet)` (static, exe+0x19E5880) turns it into
     the `Item.ID`, and is a compiled switch the mod runs with `switch_eval.h` (`game::weapon_bullet_id`, cached
     per weapon and parts beside `weapon_full_count`). Its inverse `getBulletType(Item.ID)` (exe+0x19E4860) is a
     jump table over ids 15..29 of which **12 name a kind**; `tests/test_switch.cpp` round-trips every one through
     both. A weapon whose kind names no single item (two kinds at once) falls back to the lowest bit set; a weapon
     with no kind - a knife, a grenade - keeps `BulletId` 0, which is what an empty weapon holds.
+    **A `BulletId` of 0 is a weapon the game cannot reload** (reported 2026-09-25: ammo put into the inventory,
+    "the game always thinks they have 0 ammo available"): `Inventory.getReloadableBulletMainSlot(bool)`
+    (exe+0xBBBE30, from `Equipment.getReloadableBulletNumber` / `enableReload`) reads
+    `_MainSlot._Stock.DefaultItem.BulletId` first and answers 0 for a 0; otherwise it sums `DefaultItem.Count`
+    over `getSlots(BulletId)` (`_Slots.FindAll(s => s._Stock.DefaultItem.ItemId == id)`, the lambda
+    `<getReloadableBulletMainSlot>b__0` exe+0x2F5380) plus `get_MainSlotSurplusBulletNumber` (the stock's
+    `AdditionalItem.Count`, the rounds of the other kind a swapped weapon keeps) - so ammo written into a slot by
+    field writes counts like any other; nothing about it is cached. Until 2026-09-25 every weapon the editor made
+    had `BulletId` 0 (the log's `loaded with item 0` for all 28): `game.cpp` looked `getItemID` up with
+    `re::method_code_typed(..., {"...Bullet"})` and no `true` - `find_method` matches static-ness, and the method is
+    static - so `g_bullet_item_code` stayed 0 and no log line said so. Now: the lookup says static, the discovery
+    line has `weapon ammo 1`, `game: weapon N ... takes ammo kind 0xK = item I` names the kind, and a line is logged
+    when the lookup fails. **The weapons already made** (the user's saves) are repaired: `inventory::repair_ammo_types`,
+    from the tick while the pause menu is up, gives a weapon in a slot or in the item box whose `BulletId` is 0 the
+    item its kind names - only when that kind is one bit (a weapon that takes two kinds of rounds names no single
+    item, and the game picks for those) - a field write into the stock that exists, like a count (the rule Never
+    add, remove or move a weapon by field writes: this moves nothing); logged and shown in the panel.
     `ItemManager.getMainWeaponOtherBulletID` (exe+0x56F650) is the same two switches around
     `WeaponBulletUserData.getMainWeaponOtherBullet`, which is how the pairing was found;
     `item.WeaponCombinationList.getBullet` (the `WeaponPair` list, weapon -> ammo -> result) is the game's other
@@ -1222,6 +1377,137 @@ the queue class's vtable. The panel is drawn with its own command list and alloc
 buffer, fenced on that queue. `D3DCompile` and `CreateDXGIFactory1` are defined by the mod and load
 their DLLs on first use, so the proxy imports no graphics DLL.
 
+**The Steam overlay on Windows hooks what a swap chain's vtable points to** (found 2026-09-25 on a Windows 11
+laptop, the released 1.0.2 crashing on the game's first frame every launch). `GameOverlayRenderer64.dll` wraps
+the DXGI factory and, as each swap chain is made, detours the function every slot of the swap chain's class
+vtable points to - writing a jump into its code - and keeps **one** saved original per hook
+(`gor64+0x152E50` for Present, `call rax` at +0x8F230), written by every hook it makes. The game makes two swap
+chains (a D3D11 one at start, the D3D12 one it presents through); with the mod's function in the class
+vtable between the two, the overlay's second hook took the mod's function for Present: its decoder could not
+read mingw's code (`Steam\GameOverlayRenderer.log`: `Unknown opcodes for AMD64 at 4 bytes: 48 83 EC 48 41 89
+D1 ... module=steam_api64.dll,DXGISwapChain_Present`) and left the slot 0 - a call to 0 from
+`gameoverlayrenderer64.dll+0x8F232`; with an entry it could read (`RE2CC_DETOURABLE`: dxgi's own prologue,
+three `mov [rsp+n],reg`), the slot led into the mod's function, whose own way on was Windows' Present - by then
+the overlay's hook: a circle, and a stack overflow on the render thread within a second of the first frame
+(the DirectInput frames on top of those stacks were the overlay's own input work, not the cause). **So the
+class vtable is left alone on Windows** (`overlay_d3d.cpp`, "adopting"): `install_early` (DllMain) hooks
+re2.exe's `CreateDXGIFactory1`/`2` imports (its only dxgi imports; `CreateDXGIFactory` too, for a build that
+has it), the factory's class vtable gets `QueryInterface`, `CreateSwapChain`, `CreateSwapChainForHwnd`,
+`ForCoreWindow` and `ForComposition` hooked **in place** (slots 0, 10, 15, 16, 24; on Windows with the overlay
+that factory is the overlay's own wrapper, whose vtable it never re-reads; an implementation may check a
+factory's vtable pointer against its own - Wine's dxgi asserts on it as the factory makes a swap chain - so
+the factory is not given a copy), and **every swap chain the factory makes gets a private copy of its
+vtable** (41 slots for IDXGISwapChain4, by the interfaces the object answers with the same vtable) with the
+mod's Present, ResizeBuffers, Present1 and ResizeBuffers1, its own vtable pointer moved to the copy. No
+vtable another hooker reads holds a function of the mod's; the hooks call on to the class's own functions
+(detoured in place by the overlay or not); and a D3D12 swap chain comes with the command queue the game made
+it with, so no throwaway D3D12 device is needed. Under Wine the import hooks are not installed (the class
+hook has been the panel's way there all along; `RE2CC_ADOPT` in the environment forces them - the test);
+the class hook is the fallback (no dxgi import, or nothing adopted within 10 s of the game's window), made
+through a throwaway **WARP** swap chain 2 s after the window is up: a hardware one made while the game was
+making its own devices crashed inside NVIDIA's D3D11 driver (`nvwgf2umx.dll` -> ntdll, twice in six
+runs). `tests/test_adopt.cpp` runs the adoption under Wine: the factory in place, a swap chain's copy, a
+Present through it. **Seen in game on Windows** (the laptop, 2026-09-25 15:29, the user: "it works on
+windows now"): both imports hooked at DllMain, the factory (from `CreateDXGIFactory2`, 32 slots) hooked in
+place 1.9 s in, the D3D12 swap chain adopted with its queue 5 s in, the first present through it, the pause
+menu's panel drawn (`dx12: panel renderer ready` with that queue), a clean exit. What that run did not
+exercise: the cheats on Windows, the dx11_non-rt build on Windows (its dxgi imports are not recorded - with
+none of the three names the fallback would go in after 10 s, and with the overlay that crashes), and
+the Proton path after today's changes (the class hook 2 s after the window, WARP first - DXVK takes WARP as
+hardware with a warning -, `re::init`'s wait, the keyboard guard's dinput8 check).
+**A DXGI wrapper beside re2.exe - OptiScaler, ReShade, Special K** (a player's 1.0.3 log, 2026-09-25 evening:
+a 25 MB `dxgi.dll` in the process and the game crashed in that wrapper's code the instant its swap chain had
+been adopted; the player then said OptiScaler, for DLSS). All three (sources read that day: optiscaler/OptiScaler
+`OptiScaler/wrapped/wrapped_swapchain.*`, crosire/reshade `source/dxgi/dxgi_swapchain.*`, SpecialKO/SpecialK
+`src/render/dxgi/dxgi_swapchain.*`) hand the game a proxy object around DXGI's swap chain, a whole `IDXGISwapChain4`
+(41 slots), and answer `QueryInterface` with an IID of their own - ReShade's `IID_UnwrappedObject`
+{7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42} and Special K's `IID_IUnwrappedDXGISwapChain`
+{E8A33B4A-1405-424C-AE88-0D3E9D46C914} for the object inside, OptiScaler's `__uuidof(WrappedIDXGISwapChain4)`
+{3AF622A3-82D0-49CD-994F-CCE05122C222} for itself; each adds the reference it should. Two lessons, both now in
+`adopt_chain`:
+- **The crash was OptiScaler's virtual destructor.** `WrappedIDXGISwapChain4` declares
+  `virtual ~WrappedIDXGISwapChain4()`, which MSVC puts in the vtable slot after the interface's 41; its `Release`
+  at zero does `delete this` through the object's vtable pointer - the mod's copy - and a copy of 41 slots ended
+  in whatever the heap held next: `call rax` (its CFG dispatch, `jmp rax` in a process without CFG) to an
+  unmapped address, `this` in rcx, from the wrapper's code on the game's thread, the instant the game let go of
+  a swap chain. So every adopted object gets a copy of **64 slots** (`kCopySlots`; fewer only when the read
+  faults, never fewer than the interface's) - the extra ones the class's own bytes for its own use; the mod
+  touches only the four it hooks. ReShade's destructor is not virtual and Special K's is commented out, so
+  neither would have shown it; DXGI's own object had not either.
+- **Never ask a proxy which swap chain interfaces it has.** Special K's `QueryInterface` for a higher one than
+  its proxy was made with (`IWrapDXGISwapChain::QueryInterface`, `ver_ < required_ver`) promotes the inner object
+  and hands the proxy back WITHOUT `AddRef`, so the `Release` that pairs with it takes the proxy's only
+  reference: its `Release` tears down its render backend, releases the real swap chain and deletes itself,
+  under the game. (That was the first reading of the crash, before the player named OptiScaler, whose
+  `QueryInterface` counts right; it is a real hazard all the same.) A proxy known by its IID is taken as
+  IDXGISwapChain4; DXGI's own object (its vtable in Windows' `dxgi.dll`, `is_windows_dxgi`: the module's file is
+  `<system dir>\dxgi.dll` - not a `LoadLibrary` of that path, which OptiScaler answers with itself, see below) is
+  asked as before; anything else - OptiScaler's `Dx11wDx12SC`, an FSR/XeSS frame-generation swap chain, a
+  wrapper not yet met - is sized without asking: IDXGISwapChain3 (40) when it was made with a D3D12 queue (the
+  game could not use it otherwise), else IDXGISwapChain1 (29) from the `ForHwnd/ForCoreWindow/ForComposition`
+  calls and IDXGISwapChain (18) from `CreateSwapChain`. `Owned.iface` is that; `Owned.slots` the copy.
+  `dx12_frame` reads the back buffer index by a straight call to slot 36 when `iface >= 40` (no
+  `QueryInterface(IDXGISwapChain3)` - the same hazard).
+The outermost object (the game's) is what is adopted - the panel is drawn before the wrapper's Present, so
+ReShade's effects and an upscaler's output pass over it (cosmetic), and under Special K the hook is not at the
+mercy of `SK_DXGI_DispatchPresent` (which may or may not go through the real object's vtable); its methods are
+the wrapper's, which the overlay may have detoured in place - the same shape as dxgi's on a plain machine.
+`install_early` logs which `dxgi.dll` the game has (path, size, "a wrapper" when not Windows' own).
+`tests/test_adopt.cpp` plays such a wrapper: a factory and a swap chain proxy of its own, the proxy's
+`QueryInterface` handing itself back without a reference and counting how often it is asked for a higher
+interface (must be 0), a virtual destructor in the slot after the interface's, alive with one reference after
+adoption, a Present through it reaching the real one, destroyed by the game's Release through the copy. Not yet
+seen in game beside a real OptiScaler, ReShade or Special K (the laptop can: any of them as `dxgi.dll` in its
+game folder). Also found there: the game's code is
+linked a moment after the database's arrays are rebased, so `re::init`
+now waits for the count of methods with code to stop moving (the mod read knives 0, typewriters 0 before);
+and the game's DirectInput keyboard is `EXCLUSIVE | FOREGROUND` on Windows (The keyboard), yet the window
+still gets `WM_KEYDOWN`/`WM_CHAR` there, so the panel's own DirectInput device is Wine-only now.
+**REFramework beside the mod on Windows** (a player's 1.0.5 logs, 2026-09-26: REFramework as `dinput8.dll` with
+two plugins, OptiScaler as the 25.5 MB `dxgi.dll`; "it didn't allow the usage of any mod using REFramework"). How
+REFramework finds the game's frames (`src/D3D12Hook.cpp`, read that day): a throwaway D3D12 device, a factory of
+its own and a swap chain **for composition** (no window; then a hidden window of its own thread's, then the
+desktop's), a `PointerHook` on **slot 8 of that swap chain's vtable** - DXGI's class vtable, which the game's swap
+chain shares -, and the first Present through it (after its `WindowFilter` has seen the window once) removes that
+hook, `VtableHook`s the game's object (a copy of whatever vtable the object has, the entry before it included, its
+own Present/ResizeBuffers/ResizeTarget in 8/13/14) and calls on through the old vtable's slot. Current versions
+also `PointerHook` the factory class's `CreateSwapChainForHwnd` (slot 15) - after the mod's in-place hook, whose
+function becomes its original - and re-hook on every swap chain the game makes. With 1.0.3-1.0.5 the throwaway came
+through the factory slots hooked in place, was adopted, and REFramework's hook went into its private copy; the game's
+frames never reached it (and a hook REFramework put into the class vtable when the table of adopted objects was
+full, once, was bypassed too: the mod called the function the class had *at adoption*). Its log: `Last chance
+encountered for hooking` / `Sending rehook request for D3D` every 11 s for the whole session, each rehook a new
+throwaway (adopted again, filling the table of 16) and, in the player's version, every thread of the game
+suspended for the hook; no REFramework initialisation line at all. **Fixed** (`overlay_d3d.cpp`): only a swap
+chain made for a window of the game's (`game_window`: this process's, made by the thread that loaded the mod -
+WinMain's - or of class `via`) is adopted - one for composition, a CoreWindow or another thread's window keeps its
+class vtable, with a log line naming the code that asked (`leave_alone`, the first 8) -, and the hooks call on
+through **the class vtable's slot as it is at the time** (`original()`), so a hook put there after adoption gets the
+game's frames; what the class had at adoption is called instead when the slot holds the mod's own function (the
+fallback class hook) or while a call on through the class is already under way on the thread (`t_calls`: a class
+hook that calls the object's vtable again - REFramework's does once, as it moves - comes back into the mod's hook,
+which then goes on to DXGI, not into itself; that nested Present does not draw the panel twice). The copy also
+keeps the entry before the vtable (MSVC's type information; REFramework copies it too), and the table holds 64.
+`tests/test_adopt.cpp` plays REFramework's sequence and a re-dispatching class hook; the 1.0.4 DLL fails exactly
+those 7 checks. Not yet seen in game with REFramework. **OptiScaler answers every `LoadLibrary` of a `dxgi.dll`
+with itself** (`hooks/LibraryLoad_Hooks.cpp`: "call, returning this dll!") - the mod's `LoadLibrary` of
+`System32\dxgi.dll` got OptiScaler, so the log did not call the game's `dxgi.dll` a wrapper and DXGI's own swap
+chains were "an object of another kind" (harmless: sized 40, copied 64); now told by path. OptiScaler hooks by
+Detours (code), never by vtable, so the copies do not bypass it.
+**The same player's small window** ("put the game into a smaller window stuck in the top left corner of the
+screen", 4K monitor: the swap chain went 1920x1080 -> 3840x2160 1.3 s after the first frame) is **not explained**.
+The mod never moves or sizes the window. The game's DX12 Fullscreen path (exe+0x2B30F4C) is
+`SetFullscreenState(FALSE)`, `SetWindowPos(monitor's left/top, SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)`,
+`SetFullscreenState(TRUE)` - a fullscreen request that does not take leaves exactly that picture. The adopted copy
+is not the cause as far as DXGI goes: the player's `dxgi.dll` is the laptop's (`CDXGISwapChain`'s vtable at
+dxgi.dll+0xCD688, Present +0x19530 in both), its constructor at +0x20794 sets eleven vtable pointers, the primary
+one at most 47 slots (the next address the code refers to), nothing compares a vtable pointer, and it has RTTI for
+exception types only. So the mod now logs what would tell: every `SetFullscreenState` of the game's (a copy slot of
+its own, 10; the result, and the foreground window when it fails), the window and monitor rectangles at each
+resize and at the first frame with the window's DPI awareness, and (`dllmain.cpp`) the DLLs in the game that are
+neither its own nor Windows' once the panel's way on screen is settled. re2.exe has no manifest and calls no DPI
+function (not DPI aware by itself).
+
 ### The keyboard (src/keyboard.cpp)
 - **The game's input**: `via.hid` makes one DirectInput device per kind (exe+0x2462650: `CreateDevice` with
   `GUID_SysKeyboard` for type 2, `GUID_SysMouse` for 3, an enumerated pad's GUID otherwise) and sets each up
@@ -1257,6 +1543,29 @@ their DLLs on first use, so the proxy imports no graphics DLL.
   keys pressed while it has it, stay hidden until released (the Enter that commits a value must not reach the pause
   menu when the field lets go); the device's buffer losing events resyncs from its immediate state.
 
+## Seen in game: the dx11_non-rt build (11055033), 2026-09-24
+The user's first run (about two minutes: the title's Load Game, a Hardcore save loaded, every cheat
+switched on, a few steps and shots, the item box opened, the inventory editor), `Trace = 1`; the user:
+"it all seems to work". The log confirms:
+- The proxy with the branch's 2016 Steam DLL: 367 functions stubbed, the 12 the exe imports all there.
+- The database v66 at VM+0x3DD0 and **the static table at VM+0x3DA0 - 0x30 before it**, as in TDB 70.
+- Discovery complete (0 missing); `call: ready`; the frame's table (227 entries, UpdateBehavior entry 110,
+  EndRendering 157); 120 frames a second; the panel drawn through Direct3D 12.
+- Every vtable hook in **at start-up**, before the game's first frame - PlayerCondition's two (God mode)
+  well before any player starts; the Think family in 41 of its 43 vtables (two classes not up; tried again
+  every second); TriggerUseItem 1/1; getTriggerFuncCheckValid.
+- **The retargeted typewriter delegates work**: both check lambdas "called by the game (first time)"
+  through the delegates `getTriggerFuncCheckValid` returned (at the loaded area's setup).
+- Infinite ammo (a shot kept its rounds), Freeze step count and Item box without counting (their counts put
+  back), the inventory screen's hook, the inventory editor (a slot filled).
+- The save files: the list read with its texts from the engine's UTF-16 strings (titles, rows, times right).
+  Steam's remote storage came from the client (VERSION013).
+Not yet exercised in that run (no hit taken or dealt - the three enemies near were GUTS_MODE, at full health;
+no window boarded; no knife; no save; no Delete or Copy; no records screen; no difficulty switch; no item box
+Take/Store): One hit kills' Think hook acting, God mode's heal, the boards' marking, the knife's entry hooks
+(does the engine call `Weapon.onHitAttack`/`Equipment.defend` through the entry here?), a Hardcore save with
+no ribbon, the save files' field-write refresh, the records panel, the difficulty switch.
+
 ## Seen in game (build 11636119, Proton Experimental under gamescope, DX12, 2026-09-16)
 - The type database is loaded by the time the mod thread looks (VM+0x35D8, header flag 0); the VM
   global is exe+0x9178E98 and the static table VM+0x35A8 (79 479 entries), 0x30 before it as expected.
@@ -1278,6 +1587,21 @@ their DLLs on first use, so the proxy imports no graphics DLL.
   Matilda up from 9 to 10 after each shot). Store worked; clicks reach the panel.
 
 ## Open questions
+- **The dx11_non-rt build's first run** - done 2026-09-24 (Seen in game: the dx11_non-rt build): start-up,
+  the hooks, the typewriter's delegates and the save list confirmed; what it did not exercise is listed
+  there. Saves were backed up to `.save-backup-2026-09-24/`. What to look for, as written before the run: `re: TDB v66
+  header ... (the dx11_non-rt build)`, `re: VM ..., static table at VM+0x...` (REFramework assumes 0x30 before
+  the database pointer for every version: does it hold, or does the fallback search find it?), the discovery
+  lines (all `1`, as `test_discover` gives), `app:` the frame's table and its hooks, `call: ready`, `save files:
+  the game's code read ... (the engine's own UTF-16 ...) ... by field writes`, and `events:` - PlayerCondition's
+  two slots hooked **before a game is loaded** (God mode's delegates are made as the player starts), the Think
+  family (`hooked in N more vtable(s)`), `getTriggerFuncCheckValid` hooked, the TriggerUseItem family, each
+  one's first call. In play: the panel on the pause menu (DX11); God mode heals every hit; One hit kills - a
+  zombie dies on the first damaging hit (does its death look right, with `<IsKill>` set after the reaction?),
+  Mr. X kneels, a plant burns up, G2 staggers; Hardcore typewriter saves without a ribbon; a window is
+  boarded and the boards stay; the knife keeps full; infinite ammo; the item box's Take/Store and the
+  inventory editor; the difficulty switch; the records panel (a record on/off, the save); the save files -
+  rows read (texts, times), Delete and Copy, and the list read again after each (the field-write refresh).
 - Store stacking in game: ammo onto a box stack with room, onto a full one (a new stack), more than fits with
   the box full (the rest stays in the slot); the game's own item box shows the counts, and its own stores stack
   onto the same entries (log: `game: discovery ... stacks 1 (N items stack above 1)`, `inventory: stored ...`).
@@ -1424,8 +1748,28 @@ their DLLs on first use, so the proxy imports no graphics DLL.
   play time, save count)? That settles whether a slot's number is anywhere inside its file. Does "Continue" on the title
   now pick the copy (its time stamp)? Does the game's cursor jump back as expected after the refresh, and does the list
   refresh take long (the worker reads every slot through Steam)?
+- **REFramework beside the mod on Windows** (the fix of 2026-09-26, Overlay): the log should have one `overlay: a swap
+  chain made for no window (CreateSwapChainForComposition, called from dinput8.dll+0x...) is not the game's` per
+  REFramework hook, and REFramework's own log `Hooked DirectX 12` once, **no** `Last chance encountered for hooking`
+  after it, and its initialisation lines; its menu (Insert) up, its plugins and scripts working, and the mod's panel
+  on the pause menu drawn over REFramework's. `modules:` names what else is in the game. And the small window: with
+  the game in Fullscreen, what do `overlay: the game asked DXGI for exclusive fullscreen: hr ...` and the resize lines
+  (`its window WxH at X,Y ..., its monitor WxH`) say - does the request fail (the foreground window it names), or
+  succeed with the window left small? Does it happen with the mod's `steam_api64.dll` taken out (REFramework and
+  OptiScaler still in), and in Borderless Window?
 
 ## Tooling notes
+- `tests/test_discover.cpp` runs the mod's own start-up over a real `re2.exe`, either build, with no game
+  running: the exe mapped as an image, `GetModuleHandleA(nullptr)` pointed at it, its database rebased in
+  place, every method's code filled from its link records (`tools/tdb_dump.py --write-methods`), a stand-in
+  VM object in the VM global; then `re::init`, `game::discover`, `records::discover`, `savefiles::discover`,
+  `call::init`, `events::install`, `app::find` and the save files' first tick, and the log they write. RT's
+  run gives what the game gave in play (knives 3, raccoon records 55/88, lock record 54, 15 accessories, the
+  call bridge's helpers, the frame's table); the dx11_non-rt run is how that build was ported. Link with
+  every `build/*.o` but `dllmain.o`, the imgui objects and the mod's libs (under bash: zsh does not split
+  `$OBJS`).
+- `tools/tdb_dump.py` reads both databases (class TDB66); `--link` prints each method's code RVA from the
+  link records, `--write-methods` writes them in DumpMethods' format.
 - `tests/test_mem.cpp` tests the guarded copies (`src/mem.cpp`) - unmapped, reserved, no-access, read-only
   and guard pages, other handlers' exceptions, eight threads - and times a read.
 - `tests/test_records.cpp` tests the records panel's rules (`src/records_rules.h`: switched on earns a record by the
@@ -1452,8 +1796,31 @@ their DLLs on first use, so the proxy imports no graphics DLL.
 - The tests run under system Wine in a scratch prefix: `WINEPREFIX=<scratchpad>/wineprefix
   WINEDEBUG=-all wine ...` (the EGL warnings are Wine probing a headless GPU). `tests/test_load.cpp`
   loads the built proxy beside the real Steam DLL (renamed), calls through two thunks, reads the
-  forwarded data export and unloads it.
+  forwarded data export and unloads it; beside another version of the Steam DLL (any other game's), a
+  function the original lacks must answer 0 through its thunk. With no original the proxy's message box
+  blocks: run it with the null graphics driver and a `timeout`, then read the log.
+- `tests/test_proxy.cpp` tests the proxy's run-time checks: `mem::imported_names` on re2.exe mapped by
+  the loader (`DONT_RESOLVE_DLL_REFERENCES`: the twelve names above, kernel32's too), then
+  `proxy::load_original_as` with the game's twelve imports against each Steam DLL given - it must load
+  exactly when the DLL has all twelve, every thunk at the function of its name or the stub - and the
+  refusals (a name the proxy does not export, no original) and the `.dll.dll` fallback. Any
+  `steam_api64.dll` from another game serves as a foreign original: the Steam library has 2017, 2021,
+  2024 and 2025 ones.
 - `tools/tdb_dump.py --dump` takes ~8 s; `--type` needs the name map (~1 s per run).
+- **The editor's weapons reload** (2026-09-25; the user: ammo put into the inventory, "the game always thinks they have
+  0 ammo available to reload with" - a W-870 the editor made, `BulletId` 0). Log: the discovery line's `weapon ammo 1`,
+  then `game: weapon 11 (parts 0x0) is full at 4, takes ammo kind 0x2 = item 16` (the W-870: Shotgun Shells; the
+  Matilda `kind 0x1 = item 15`, the knives and grenades `kind 0x0 = item 0`) when the panel first opens. A gun picked
+  in the editor should reload from ammo the editor wrote into a slot and from ammo taken out of the box alike, and its
+  HUD count should show the rounds carried. The W-870 in the user's save: on the first pause `inventory: slot 6: W-870
+  recorded no ammo type (a weapon an earlier build made) - it takes Shotgun Shells again` (in the panel too), and it
+  reloads from then on; one stored in the box gets `item box entry N: ...`. A GM 79 the editor made stays as it is (two
+  kinds of rounds: not repaired) - does the game's own ammo swap (the inventory's Change Ammo) load it? Knives,
+  grenades and the game's own weapons must log no repair line.
+- **`re::find_method` and `re::method_code_typed` match static-ness**: a static method is found only with `true`
+  as the last argument (`isFatWeapon`, `getSaveDataIndex`, `updateSaveFileDetailTbl`, `getItemID` - `static` in
+  `tools/tdb_dump.py`'s listing), and a lookup without it answers 0 with no word said. `getItemID`'s lacked it until
+  2026-09-25 (The editor's weapons reload). `tests/test_re.cpp` pins each lookup the mod makes, both ways.
 - **`RE2CabbyCodes.methods.bin`'s index is `tdb_dump.py`'s index + 1** (found 2026-09-20 by checking known
   RVAs - `setDifficulty` [99149] = exe+0x1F2EEC0, `updateSaveFileDetailTbl` [299023] = exe+0x12CB40): read the
   RVA of method `i` at `12 + 4*(i+1)`, or every offline disassembly lands on the neighbouring method. The mod

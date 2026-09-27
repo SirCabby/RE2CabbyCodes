@@ -166,6 +166,18 @@ int main(int argc, char** argv) {
     check(rules::getter_constant(invalid, sizeof(invalid), &c) && c == INT32_MIN, "mov eax,0x80000000; ret: INT32_MIN");
     check(!rules::getter_constant(slot, sizeof(slot), &c), "a load is not a constant");
     check(rules::chars_offset(chars, sizeof(chars)) == 0x14, "String.get_Chars: characters at +0x14");
+    // The dx11_non-rt build's text getter (build 11055033's SaveFileDetail.get_Title, exe+0x1A4A200):
+    // the engine's own UTF-16 string at +0x18, copied to rsp+0x20 and made a managed one.
+    const uint8_t native[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0xF9,
+                              0x48, 0x83, 0xC2, 0x18, 0x48, 0x8D, 0x4C, 0x24, 0x20, 0xE8, 0x25, 0xE4, 0x5F,
+                              0xFE, 0x83, 0x7C, 0x24, 0x3C, 0x0C, 0x4C, 0x8D, 0x44, 0x24, 0x20, 0x8B, 0x54,
+                              0x24, 0x38, 0x48, 0x8B, 0xCF, 0x4C, 0x0F, 0x43, 0x44, 0x24, 0x20};
+    rules::NativeText t;
+    check(rules::native_text_getter(native, sizeof(native), &t) && t.offset == 0x18 && t.length == 0x18 &&
+              t.capacity == 0x1C && t.inline_below == 12,
+          "the dx11_non-rt build's get_Title: a native UTF-16 string at +0x18 (length +0x18, capacity +0x1C, inline below 12)");
+    check(rules::getter_offset(native, sizeof(native), true) == -1, "... which is no plain getter");
+    check(!rules::native_text_getter(title, sizeof(title), &t), "the current build's plain getter is no native one");
   }
 
   if (argc > 1) {

@@ -4,9 +4,11 @@
 #include <initializer_list>
 #include <string>
 
-// RE Engine's own reflection, read directly: the type database (TDB v70) the
-// game's managed runtime (via.clr) keeps every class, field and method in, and
-// the VM's table of static field blocks. Everything the mod knows about the
+// RE Engine's own reflection, read directly: the type database the game's
+// managed runtime (via.clr) keeps every class, field and method in - TDB v70 in
+// the current Steam build (11636119), TDB v66 in the dx11_non-rt beta (11055033),
+// two record layouts behind one interface - and the VM's table of static field
+// blocks. Everything the mod knows about the
 // game's objects comes through here by name - classes by full name, fields by
 // name up the class chain, singletons through their static `_Instance` field -
 // so nothing in the mod is an absolute address or a hard-coded field offset.
@@ -16,14 +18,19 @@
 // copy for reverse engineering). The VM itself is found the way REFramework
 // finds it: the global that `mov rcx,[rip+X]; mov edx,-1; call` sequences load
 // dozens of times over, whose object holds a pointer to the TDB; the static
-// table sits 0x30 bytes before that pointer (TDB 70).
+// table sits 0x30 bytes before that pointer (TDB 70; REFramework assumes the
+// same of TDB 66, and the mod checks it).
 namespace re2cc::re {
 
 // --- set-up (mod thread) ----------------------------------------------------------
 bool init();        // false = not yet (the VM is not up); call again later
 bool ready();
+// re2.exe carries no TDB 70 - another version of the game (the dx11_non-rt beta's
+// is TDB 66): init() will never succeed, and status() says so for the player.
+bool unsupported();
 const char* status();
 bool attach_tdb(uintptr_t tdb);  // tests: use an (initialised) database without a VM
+uint32_t tdb_version();           // 70 or 66 once attached (0 before)
 
 uint32_t num_types();
 uint32_t num_methods();

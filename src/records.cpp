@@ -1082,15 +1082,22 @@ bool discover() {
     tl.f_list = need_field(tl.ssd, kTallyNames[t][3]);
     tl.ok = tl.mgr && tl.ssd && tl.inst.valid() && tl.f_ssd.valid() && tl.f_list.valid();
   }
-  // The lock record: SetUnlockRecord ends `mov r9d,edx; mov r8d,ID; mov rdx,rcx` before its
-  // tail jump to setRecordCount(ID, the locks opened).
-  if (const uintptr_t code = g_tally[kLocks].mgr ? re::method_code(g_tally[kLocks].mgr, "SetUnlockRecord", 1) : 0)
-    for (uintptr_t p = code; p < code + 0x200; ++p)
-      if (mem::matches(p, "44 8B CA 41 B8 ?? ?? ?? ?? 48 8B D1")) {
-        const int32_t id = mem::read<int32_t>(p + 5);
-        if (id >= 0 && id < M.records) g_lock_record = id;
-        break;
-      }
+  // The lock record: SetUnlockRecord ends in RecordManager.setRecordCount(ID, the locks
+  // opened) - `mov r8d,ID` and, a few instructions on, the call to it: a tail jump in the
+  // current build (`mov r9d,edx; mov r8d,ID; mov rdx,rcx; ... jmp`), a call in the
+  // dx11_non-rt one (`mov r9d,edi; mov r8d,ID; mov rcx,rbx; call`). The ID is the
+  // mov whose call reaches setRecordCount.
+  const uintptr_t set_count = M.mgr ? re::method_code(M.mgr, "setRecordCount", 2) : 0;
+  if (const uintptr_t code = g_tally[kLocks].mgr && set_count ? re::method_code(g_tally[kLocks].mgr, "SetUnlockRecord", 1) : 0)
+    for (uintptr_t p = code; p < code + 0x400 && g_lock_record < 0; ++p) {
+      if (!mem::matches(p, "41 B8 ?? ?? ?? ??")) continue;
+      for (uintptr_t q = p + 6; q < p + 6 + 32; ++q)
+        if ((mem::read<uint8_t>(q) == 0xE8 || mem::read<uint8_t>(q) == 0xE9) && mem::rip_target(q, 1, 5) == set_count) {
+          const int32_t id = mem::read<int32_t>(p + 2);
+          if (id >= 0 && id < M.records) g_lock_record = id;
+          break;
+        }
+    }
   if (g_lock_record < 0)
     logf("records: GimmickDialLockManager.SetUnlockRecord is not the code expected - the lock record is not known");
 

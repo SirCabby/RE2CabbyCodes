@@ -22,6 +22,7 @@ struct Parts {
   bool damage = false;    // a hit's DamageInfo and the HP controller's NoDamage (One hit kills)
   bool equipped = false;  // a survivor's equipped main and sub slots (Infinite ammo, No durability loss)
   bool measure = false;   // GameClock._MeasureGameElapsedTime (Freeze play time)
+  bool ammo = false;      // the ammo a weapon takes: WeaponBulletUserData's kind fields and EquipmentDefine.getItemID (the editor's weapons)
   bool stacks = false;    // which items stack and how far (Store stacks like the game's item box)
   bool boards = false;    // a use-item trigger's callbacks and the item data they carry (Infinite wooden boards)
   bool g2_stun = false;   // Em7100Think.TiredHp, G2's stagger counter (One hit kills, see stun_g2)
@@ -345,18 +346,69 @@ int stack_max(int item_id);
 // WeaponCategory.Knife - what isMeleeWeapon asks - read out of that method's
 // jump table.
 bool is_melee_weapon(int weapon_id);
+// One entry of a weapon's list in WeaponBulletUserData (a LoadingPartsCombination),
+// as WeaponLoadingpartsCombination.getNumber and getKind read it.
+struct ComboEntry {
+  int priority = 0;
+  uint32_t parts = 0;  // the WeaponParts the entry is for: every one of them must be fitted
+  bool overwrite_number = false, infinity = false;
+  int number = 0;
+  bool overwrite_kind = false;
+  uint32_t kind = 0;  // EquipmentDefine.Bullet flags
+};
+struct ComboPick {
+  int count = 0;      // rounds when full; -1 unlimited; 0 when no entry said
+  uint32_t kind = 0;  // the ammo's Bullet flags; 0 when no entry said (a knife, a grenade)
+};
+// The game's rule, two passes for each figure (its lambdas <getNumber>b__0/b__1
+// and <getKind>b__0/b__1, exe+0xF65C90/0xF65D40 and exe+0x1089280/0x10892E0):
+// among the entries whose parts are all fitted, the one of lowest _Priority that
+// overwrites the figure sets it; then every entry of a lower priority still that
+// does not overwrite adds to it - the numbers added, the kinds ORed. So a
+// magazine part's entry adds its rounds to the base entry's (the Matilda: 12,
+// 24 with its high-capacity magazine), and a weapon whose only entry does not
+// overwrite the kind (WP8300-8500) still names its ammo through the second
+// pass. Until 2026-09-25 the mod ran the first pass alone.
+inline ComboPick pick_combo(const ComboEntry* e, int n, uint32_t parts) {
+  ComboPick out;
+  int best_number = INT32_MAX, best_kind = INT32_MAX;
+  for (int i = 0; i < n; ++i) {
+    if ((parts & e[i].parts) != e[i].parts) continue;
+    if (e[i].overwrite_number && e[i].priority < best_number) {
+      best_number = e[i].priority;
+      out.count = e[i].infinity ? -1 : e[i].number;
+    }
+    if (e[i].overwrite_kind && e[i].priority < best_kind) {
+      best_kind = e[i].priority;
+      out.kind = e[i].kind;
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    if ((parts & e[i].parts) != e[i].parts) continue;
+    if (!e[i].overwrite_number && e[i].priority < best_number) out.count += e[i].infinity ? -1 : e[i].number;
+    if (!e[i].overwrite_kind && e[i].priority < best_kind) out.kind |= e[i].kind;
+  }
+  return out;
+}
 // A weapon's full count as the game gives it: WeaponBulletUserData's entry for
-// the weapon, the LoadingPartsCombination whose parts it has and that overwrites
-// the number, lowest _Priority first (WeaponLoadingpartsCombination.getNumber).
-// 0 when unknown, -1 for an unlimited one.
+// the weapon and pick_combo over its list for the parts it has
+// (WeaponLoadingpartsCombination.getNumber). 0 when unknown, -1 for an unlimited
+// one.
 int weapon_full_count(int weapon_id, int parts);
-// The ammo a weapon is loaded with, as a stock records it in BulletId: the same
-// entry's `_Kind` (an EquipmentDefine.Bullet), turned into an Item.ID by the
-// game's own EquipmentDefine.getItemID - a compiled switch run here
-// (switch_eval.h). 0 for a weapon that takes no ammo (a knife, a grenade) and
-// when the rule could not be read; a weapon made with 0 records no ammo, which
-// is what an empty one holds. Both figures are read once per weapon and parts.
+// The ammo a weapon is loaded with, as a stock records it in BulletId: the kind
+// pick_combo gives (WeaponLoadingpartsCombination.getKind, an
+// EquipmentDefine.Bullet), turned into an Item.ID by the game's own
+// EquipmentDefine.getItemID - a compiled switch run here (switch_eval.h). 0 for a
+// weapon that takes no ammo (a knife, a grenade) and when the rule could not be
+// read; a weapon made with 0 records no ammo, which is what an empty one holds -
+// and one the game cannot reload: Inventory.getReloadableBulletMainSlot reads
+// the main slot's BulletId first and answers 0 rounds for a 0. Both figures are
+// read once per weapon and parts.
 int weapon_bullet_id(int weapon_id, int parts);
+// The kind those flags are (0 unknown), for callers that must know whether the
+// item is the kind's own or the lowest bit of several (a weapon that takes two
+// kinds of rounds, whose getItemID names no single item).
+uint32_t weapon_bullet_kind(int weapon_id, int parts);
 
 // --- difficulty -----------------------------------------------------------------------------------------
 // The game's difficulty is the save header's CurrentDifficulty
@@ -425,6 +477,14 @@ struct EventTargets {
   // inventory, opened for a use-item trigger, calls for the item picked (one the trigger wants, one
   // it lists as useless). Delegates made in TriggerUseItem.registerUseMode.
   uint32_t use_item = 0, use_useless = 0;
+  // The dx11_non-rt build makes the delegates of the first group (the enemy's hit
+  // handlers, the typewriter's checks, the use-item callbacks) from their code - `lea
+  // r9,[code]` - which no exchanged pointer reaches. There those three events are
+  // heard at virtual methods instead (events.cpp); found in both builds, hooked in
+  // that one only:
+  uint32_t think = 0, think_damage = 0;  // EnemyThinkBehavior.onHitDamage(DamageInfo): the hit applied (every enemy's Think)
+  uint32_t typewriter_funcs = 0;         // GimmickTypeWriter.getTriggerFuncCheckValid(Trigger): a trigger's check, as made
+  uint32_t use_trigger = 0, use_check = 0;  // TriggerUseItem.checkValid(Boolean): a use-item trigger checked, before any use
   // Where the records' counters move (Counter), all virtual:
   uint32_t item_box_action = 0, item_box_open = 0;  // fsmv2.SwitchItemToInventory.update(ActionArg): the item box opens
   uint32_t inventory_screen = 0, inventory_update = 0;  // gui.NewInventorySlotBehavior.update(): a recovery item is used
@@ -450,6 +510,12 @@ int pause_state();  // MainFlowManager.MainState.PAUSE
 uintptr_t enemy_hit_points(uintptr_t enemy_controller);             // EnemyController.<HitPoint>
 bool reaction_targets(uintptr_t reaction, uintptr_t* hpc, uintptr_t* enemy);  // EnemyReactionController's
 int make_lethal(uintptr_t hpc, uintptr_t enemy, uintptr_t info);
+// The same in the dx11_non-rt build, where the hit is heard after the game's own
+// addDamage (EnemyThinkBehavior.onHitDamage, inside the hit handler, before its
+// "was alive and is not: dead()"): the HP goes to 0 rather than down to the damage.
+// `think` is the enemy's Think behaviour; think_controller its EnemyController.
+uintptr_t think_controller(uintptr_t think);
+int make_lethal_after(uintptr_t hpc, uintptr_t enemy, uintptr_t info);
 
 // God mode.
 bool is_player(uintptr_t survivor_condition);  // a PlayerCondition
@@ -481,6 +547,10 @@ uintptr_t countdown_timer(uintptr_t behaviour);
 // the game's own reusable data, or unreadable. Touches only the item data the
 // closure holds; the marks made are remembered so that no other is ever cleared.
 int mark_boards_reusable(uintptr_t closure, bool keep);
+// The same for a use-item trigger's own item data - every entry of its Items and
+// UselessItems - in the dx11_non-rt build, where the trigger's check is what is
+// heard (TriggerUseItem.checkValid, before any use). The last change made, or 0.
+int mark_trigger_boards(uintptr_t trigger, bool keep);
 
 // G2's stagger (the crane fight in the sewers) is not its health: Em7100Think
 // keeps its own counter, TiredHp, and its onHitDamage does
@@ -509,6 +579,11 @@ int stun_g2(uintptr_t enemy);
 // make_lethal, whose kill would be a plain death where the game wants a burn-up.
 enum PlantHit { kNotAPlant = -1, kPlantLeftAlone = 0, kPlantBurned };
 int wither_plant(uintptr_t enemy, uintptr_t hpc, uintptr_t info);
+// The same after the game's addDamage (the dx11_non-rt build, see make_lethal_after):
+// the flame-only health emptied, and the health brought back up to 1 if this hit
+// took it to 0. A plant whose flame-only health is empty already - burning, or dead
+// - is left alone.
+int wither_plant_after(uintptr_t enemy, uintptr_t hpc, uintptr_t info);
 
 // The marks above are addresses of the game's objects, so they mean nothing once
 // the scenes holding them are gone: forgotten as a game session starts, before

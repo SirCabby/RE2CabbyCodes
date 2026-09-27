@@ -3,8 +3,10 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // Small memory helpers, in the spirit of the sibling mods' mem.h, for 64-bit:
@@ -205,6 +207,57 @@ inline void* iat_hook(HMODULE module, const char* dll_name, const char* fn_name,
 // Put an import slot back, but only if it still holds our hook.
 inline void iat_restore(uintptr_t slot, void* hook, void* original) {
   if (slot && original && read<void*>(slot) == hook) write<void*>(slot, original);
+}
+
+// Every name a module imports from a DLL (its name matched without case), through
+// its import table and its delay-load table alike - re2.exe delay-loads
+// steam_api64.dll, and the proxy asks which of its functions the game will want.
+// Ordinals are skipped. Range-checked like iat_slot: the proxy asks inside DllMain.
+inline std::vector<std::string> imported_names(HMODULE module, const char* dll_name) {
+  std::vector<std::string> out;
+  IMAGE_NT_HEADERS* nt = nt_headers(module);
+  if (!nt) return out;
+  const auto base = reinterpret_cast<uintptr_t>(module);
+  const Range image = module_range(module);
+  auto in_image = [&](uintptr_t a, size_t n) { return a >= image.begin && a + n <= image.end && readable(a, n); };
+  // A NUL-terminated name inside the image, or null.
+  auto name_at = [&](uintptr_t a) -> const char* {
+    for (uintptr_t c = a; c < a + 512 && in_image(c, 1); ++c)
+      if (*reinterpret_cast<const char*>(c) == '\0') return reinterpret_cast<const char*>(a);
+    return nullptr;
+  };
+  // A table of IMAGE_THUNK_DATA naming functions, up to its zero entry.
+  auto add_names = [&](uintptr_t table) {
+    for (uintptr_t t = table; in_image(t, sizeof(IMAGE_THUNK_DATA)); t += sizeof(IMAGE_THUNK_DATA)) {
+      const auto thunk = read<IMAGE_THUNK_DATA>(t);
+      if (!thunk.u1.AddressOfData) break;
+      if (IMAGE_SNAP_BY_ORDINAL(thunk.u1.Ordinal)) continue;
+      if (const char* name = name_at(base + thunk.u1.AddressOfData + offsetof(IMAGE_IMPORT_BY_NAME, Name)))
+        out.emplace_back(name);
+    }
+  };
+  const IMAGE_DATA_DIRECTORY& imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  if (imports.VirtualAddress)
+    for (uintptr_t d = base + imports.VirtualAddress; in_image(d, sizeof(IMAGE_IMPORT_DESCRIPTOR));
+         d += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+      const auto desc = read<IMAGE_IMPORT_DESCRIPTOR>(d);
+      if (!desc.Name) break;
+      // The names are in OriginalFirstThunk only: FirstThunk holds the bound addresses by now.
+      const char* name = name_at(base + desc.Name);
+      if (name && _stricmp(name, dll_name) == 0 && desc.OriginalFirstThunk) add_names(base + desc.OriginalFirstThunk);
+    }
+  const IMAGE_DATA_DIRECTORY& delayed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+  if (delayed.VirtualAddress)
+    for (uintptr_t d = base + delayed.VirtualAddress; in_image(d, sizeof(IMAGE_DELAYLOAD_DESCRIPTOR));
+         d += sizeof(IMAGE_DELAYLOAD_DESCRIPTOR)) {
+      const auto desc = read<IMAGE_DELAYLOAD_DESCRIPTOR>(d);
+      if (!desc.DllNameRVA) break;
+      // RVAs; the old kind of descriptor held 32-bit addresses, which no 64-bit image has.
+      if (!desc.Attributes.RvaBased) continue;
+      const char* name = name_at(base + desc.DllNameRVA);
+      if (name && _stricmp(name, dll_name) == 0 && desc.ImportNameTableRVA) add_names(base + desc.ImportNameTableRVA);
+    }
+  return out;
 }
 
 // --- pattern scanning --------------------------------------------------------

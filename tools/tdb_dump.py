@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Read RE Engine's type database (TDB v70) straight out of re2.exe on disk.
+"""Read RE Engine's type database straight out of re2.exe on disk - TDB v70 (the
+current Steam build, 11636119) or TDB v66 (the dx11_non-rt beta, 11055033).
 
     python3 tools/tdb_dump.py --exe "$GAME_DIR/re2.exe" --dump tdb.txt       # every type, one block each
     python3 tools/tdb_dump.py --exe "$GAME_DIR/re2.exe" --type app.ropeway.gamemastering.InventoryManager
@@ -12,8 +13,10 @@ RE2's executable carries its whole reflection database in .data, uninitialised: 
 header's array pointers are offsets from the header itself (the VM turns them into
 pointers when it starts, and sets `initialized`). Layout per REFramework's tdb70/tdb69
 structs (shared/sdk/RETypeDB.hpp, RETypeDefinition.hpp), confirmed here by every
-array ending exactly where the next begins. Method function pointers are absolute
-VAs in the file (relocated at load); they are printed as RVAs. Pure stdlib.
+array ending exactly where the next begins; TDB v66 per its tdb66 structs, except that
+the init data is the array at 0x88 (counted at 0x28) - see TDB66. Method function
+pointers are absolute VAs in the file (relocated at load); they are printed as RVAs.
+Pure stdlib.
 """
 import argparse, mmap, re, struct, sys
 
@@ -84,16 +87,71 @@ class TDB:
         self._names = {}
 
     @staticmethod
-    def find(pe):
+    def find(pe, version=70):
         _, va, vs, ro, rs = pe.section(".data")
         m = pe.m
         pos = m.find(b"TDB\0", ro, ro + rs)
         while pos != -1:
             ver = struct.unpack_from("<I", m, pos + 4)[0]
-            if ver == 70 and struct.unpack_from("<Q", m, pos + 0x60)[0] == 0x300:
+            if version == 70 and ver == 70 and struct.unpack_from("<Q", m, pos + 0x60)[0] == 0x300:
+                return pos
+            if version == 66 and ver == 66 and (pos - ro) % 8 == 0:
                 return pos
             pos = m.find(b"TDB\0", pos + 1, ro + rs)
-        raise SystemExit("TDB v70 not found in .data")
+        raise SystemExit("TDB v%d not found in .data" % version)
+
+    @staticmethod
+    def open(pe):
+        """The database in this exe, whichever version it is."""
+        _, va, vs, ro, rs = pe.section(".data")
+        pos = pe.m.find(b"TDB\0", ro, ro + rs)
+        while pos != -1:
+            ver = struct.unpack_from("<I", pe.m, pos + 4)[0]
+            if (pos - ro) % 8 == 0 and ver in (66, 70):
+                return TDB66(pe, pos) if ver == 66 else TDB(pe, TDB.find(pe, 70))
+            pos = pe.m.find(b"TDB\0", pos + 1, ro + rs)
+        raise SystemExit("no TDB v70 or v66 in .data")
+
+    def type_sizes(self, i):
+        ti = self.typeimpl(self.typedef(i)["impl"])
+        return ti["field_size"], ti["static_size"]
+
+    # The VM links method code at start-up from one record per class in .data: the
+    # class's type index, its vtable and the array of its methods' code in database
+    # order. Read here, they give every method's code RVA with no game running - what
+    # a DumpMethods file gives, for either build.
+    LINK_RECORD = 0x28  # TDB 70: {u32 type, u32 ?, u32 vt slots, u32 methods, u64 vtable, u64 code, u64 global}
+
+    def link_record(self, o):
+        ty, _f, nvt, n, vt, code = struct.unpack_from("<IIIIQQ", self.pe.m, o)
+        return ty, nvt, n, vt, code
+
+    def num_methods(self, ty):
+        return self.typeimpl(self.typedef(ty)["impl"])["num_methods"] if self.typedef(ty)["member_method"] else 0
+
+    def link_codes(self):
+        m, base = self.pe.m, self.pe.image_base
+        _, dva, dvs, dro, drs = self.pe.section(".data")
+        _, tva, tvs, _, _ = self.pe.section(".text")
+        counts, codes = {}, {}
+        o, end = dro, dro + drs - self.LINK_RECORD
+        while o < end:
+            ty, nvt, n, vt, code = self.link_record(o)
+            if 0 < ty < self.n_types and 0 < n < 5000 and nvt < 5000 and base < code < base + 0x10000000 and \
+                    (vt == 0 or base < vt < base + 0x10000000):
+                if ty not in counts:
+                    counts[ty] = self.num_methods(ty)
+                if n == counts[ty]:
+                    arr = self.pe.rva_to_off(code - base)
+                    first = self.typedef(ty)["member_method"]
+                    if arr is not None:
+                        for k, v in enumerate(struct.unpack_from("<%dQ" % n, m, arr)):
+                            if v and tva <= v - base < tva + tvs:
+                                codes[first + k] = v - base
+                    o += self.LINK_RECORD
+                    continue
+            o += 8
+        return codes
 
     # --- raw access -------------------------------------------------------------------
     def string(self, off):
@@ -286,9 +344,9 @@ class TDB:
         while p and len(chain) < 24:
             chain.append(self.name(p))
             p = self.typedef(p)["parent"]
-        ti = self.typeimpl(t["impl"])
+        field_size, static_size = self.type_sizes(i)
         print("type %d %s  size=0x%X fields=0x%X static=0x%X objtype=%d flags=0x%X fqn=%08X" % (
-            i, self.name(i), t["size"], ti["field_size"], ti["static_size"], t["obj_type"], t["flags"], t["fqn"]), file=out)
+            i, self.name(i), t["size"], field_size, static_size, t["obj_type"], t["flags"], t["fqn"]), file=out)
         if chain:
             print("  : " + " : ".join(chain), file=out)
         levels = [i] + ([x for x in self._parents(i)] if inherited else [])
@@ -321,6 +379,123 @@ class TDB:
             p = self.typedef(p)["parent"]
 
 
+class TDB66(TDB):
+    """TDB v66 - the dx11_non-rt build (11055033), REFramework's tdb66 structs.
+
+    No impl records: typedefs (0x78), fields (0x14) and methods (0x20) carry their own
+    names and counts, type indices are 16 bits, a method's parameters are a list of
+    8-byte {type:16 flags:16 name:31} in the byte pool and its code pointer is at +0x18.
+    Header: counts at 0x0C (types, methods, fields, properties, events, ?, params 0x24,
+    init data 0x28, ? 0x2C, intern strings, modules, dev/app entry, strings 0x40,
+    bytes 0x44), array offsets from 0x48 (modules, types, methods, fields, properties,
+    events, -, params, init data 0x88, ? 0x90, strings 0x98, bytes 0xA0, intern
+    strings 0xA8). REFramework's struct calls 0x88 the init data's neighbour and 0x90
+    the init data; the sizes (0x28's count x 4 fills 0x88..0x90) and the enum literals
+    (MainState.PAUSE = 9 only this way) say otherwise.
+    """
+
+    def __init__(self, pe, off):
+        self.pe = pe
+        self.runtime_rvas = {}
+        m = pe.m
+        self.off = off
+        self.rva = pe.off_to_rva(off)
+        h = struct.unpack_from("<18I", m, off)
+        (magic, self.version, self.initialized, self.n_types, self.n_methods, self.n_fields, self.n_props,
+         self.n_events, _unk, self.n_params, self.n_init_data, _n90, self.n_intern, self.n_modules, self.dev_entry,
+         self.app_entry, self.n_strings, self.n_bytes) = h
+        assert magic == 0x424454, "no TDB magic"
+        (self.p_modules, self.p_types, self.p_methods, self.p_fields, self.p_props, self.p_events, _p78,
+         self.p_params, self.p_init_data, _p90, self.p_strings, self.p_bytes, self.p_intern) = struct.unpack_from(
+            "<13Q", m, off + 0x48)
+        if self.initialized:
+            raise SystemExit("this TDB is initialised (absolute pointers) - read it from the exe on disk, not a dump")
+        self._names = {}
+
+    def typedef(self, i):
+        o = self.off + self.p_types + i * 0x78
+        a = struct.unpack_from("<Q", self.pe.m, o)[0]
+        fqn, crc = struct.unpack_from("<II", self.pe.m, o + 8)
+        name, ns, flags = struct.unpack_from("<III", self.pe.m, o + 0x18)
+        system, obj_type = self.pe.m[o + 0x24], self.pe.m[o + 0x26]
+        ctor, field_size, size = struct.unpack_from("<III", self.pe.m, o + 0x28)
+        mm, mf, mp = struct.unpack_from("<III", self.pe.m, o + 0x38)
+        gen, vt = struct.unpack_from("<iI", self.pe.m, o + 0x50)
+        return dict(index=a & 0xFFFF, parent=(a >> 32) & 0xFFFF, declaring=(a >> 48) & 0xFFFF, obj_type=obj_type,
+                    system=system, flags=flags, size=size, fqn=fqn, crc=crc, ctor=ctor, vt=vt, name=name, ns=ns,
+                    field_size=field_size, num_methods=mm & 0xFFF, member_method=(mm >> 12) & 0x7FFFF,
+                    num_fields=mf & 0xFFF, member_field=(mf >> 12) & 0x7FFFF, num_prop=mp & 0xFFF,
+                    member_prop=(mp >> 12) & 0x7FFFF, generics=gen, impl=None)
+
+    def type_sizes(self, i):
+        return self.typedef(i)["field_size"], 0
+
+    def short_name(self, i):
+        t = self.typedef(i)
+        return self.string(t["ns"]), self.string(t["name"])
+
+    def generic_args(self, i):
+        t = self.typedef(i)
+        if t["generics"] <= 0 or t["generics"] >= self.n_bytes:
+            return []
+        w = struct.unpack_from("<I", self.pe.m, self.byte_at(t["generics"]))[0]
+        definition, num = w & 0xFFFF, w >> 16
+        if definition == i or num == 0 or num > 16:
+            return []
+        return list(struct.unpack_from("<%dH" % num, self.pe.m, self.byte_at(t["generics"]) + 4))
+
+    def fields_of(self, i):
+        t = self.typedef(i)
+        out = []
+        for k in range(t["num_fields"]):
+            idx = t["member_field"] + k
+            o = self.off + self.p_fields + idx * 0x14
+            a, name, flags, init, offset = struct.unpack_from("<QIHHI", self.pe.m, o)
+            out.append(dict(index=idx, name=self.string(name), type=(a >> 16) & 0xFFFF, offset=offset, flags=flags,
+                            init=init))
+        return out
+
+    def methods_of(self, i):
+        t = self.typedef(i)
+        out = []
+        for k in range(t["num_methods"]):
+            idx = t["member_method"] + k
+            o = self.off + self.p_methods + idx * 0x20
+            a, _pad, _invoke, name, flags, iflags, params, fn = struct.unpack_from("<QHhIHHIQ", self.pe.m, o)
+            vt = struct.unpack_from("<h", self.pe.m, o + 2)[0]
+            num = (a >> 32) & 0xFF
+            ps = []
+            for p in range(num):
+                if params + 8 * (p + 1) > self.n_bytes:
+                    break
+                w = struct.unpack_from("<Q", self.pe.m, self.byte_at(params) + 8 * p)[0]
+                ps.append((w & 0xFFFF, self.string((w >> 32) & 0x7FFFFFFF)))
+            out.append(dict(index=idx, name=self.string(name), fn=fn, flags=flags, vt_index=vt,
+                            ret=(a >> 48) & 0xFFFF, params=ps))
+        return out
+
+    def props_of(self, i):
+        return []
+
+    # TDB 66's link record: {u64 type, u64 ?, u64 vtable, u64 vt slots, u64 code, u64 methods, 0, 0, u64 global}.
+    LINK_RECORD = 0x48
+
+    def link_record(self, o):
+        ty, _f, vt, nvt, code, n = struct.unpack_from("<6Q", self.pe.m, o)
+        return ty, nvt, n, vt, code
+
+    def num_methods(self, ty):
+        return self.typedef(ty)["num_methods"]
+
+    def init_data(self, index):
+        if index >= self.n_init_data:
+            return None
+        off = struct.unpack_from("<i", self.pe.m, self.off + self.p_init_data + index * 4)[0]
+        if off < 0:
+            return ("str", self.string(-off))
+        return ("bytes", self.byte_at(off))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--exe", required=True)
@@ -330,15 +505,27 @@ def main():
     ap.add_argument("--enum", action="append", default=[], help="print an enum's values")
     ap.add_argument("--summary", action="store_true")
     ap.add_argument("--methods", help="RE2CabbyCodes.methods.bin (DumpMethods = 1): print each method's code RVA")
+    ap.add_argument("--link", action="store_true",
+                    help="print each method's code RVA as the VM will link it, read from the exe's link records")
+    ap.add_argument("--write-methods", help="write the link records' code RVAs in DumpMethods' format (tests)")
     a = ap.parse_args()
     pe = PE(a.exe)
-    tdb = TDB(pe)
+    tdb = TDB.open(pe)
     if a.methods:
         raw = open(a.methods, "rb").read()
         magic, version, count, _ = struct.unpack_from("<4I", raw, 0)
         if magic != 0x4D324552 or count != tdb.n_methods:
             sys.exit("%s is not a methods dump of this re2.exe (magic 0x%X, %d methods)" % (a.methods, magic, count))
         tdb.runtime_rvas = {i: r for i, r in enumerate(struct.unpack_from("<%dI" % count, raw, 16)) if r}
+    if a.link or a.write_methods:
+        tdb.runtime_rvas = tdb.link_codes()
+        print("link records: %d of %d methods have code" % (len(tdb.runtime_rvas), tdb.n_methods))
+    if a.write_methods:
+        rvas = [tdb.runtime_rvas.get(i, 0) for i in range(tdb.n_methods)]
+        with open(a.write_methods, "wb") as out:
+            out.write(struct.pack("<4I", 0x4D324552, 1, tdb.n_methods, 0))
+            out.write(struct.pack("<%dI" % len(rvas), *rvas))
+        print("wrote %s" % a.write_methods)
     if a.summary or not (a.dump or a.type or a.grep or a.enum):
         print("TDB v%d at file 0x%X (RVA 0x%X): %d types, %d methods, %d fields, %d params, strings 0x%X, bytes 0x%X" % (
             tdb.version, tdb.off, tdb.rva, tdb.n_types, tdb.n_methods, tdb.n_fields, tdb.n_params, tdb.n_strings, tdb.n_bytes))

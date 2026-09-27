@@ -63,6 +63,10 @@ re::Field f_cd_timer, f_rogue_timer;
 // Infinite wooden boards: a use-item trigger's callback closures, their ItemWork and its item data.
 uint32_t t_use_closure[2], t_item_work, t_use_data;
 re::Field f_closure_work[2], f_work_data, f_use_stock, f_use_item, f_use_reuse;
+// The dx11_non-rt build's hook points (EventTargets): an enemy's Think and its
+// controller, a use-item trigger and its two lists of item data.
+uint32_t t_think, t_use_trigger;
+re::Field f_think_controller, f_trigger_items, f_trigger_useless;
 re::Field f_bullet_ud, f_bullet_combos, f_wc_type, f_wc_combos, f_pc_parts, f_pc_priority, f_pc_overwrite, f_pc_infinity,
           f_pc_number, f_pc_overwrite_kind, f_pc_kind;
 // EquipmentDefine.getItemID(Bullet): the ammo item a Bullet kind is, run for
@@ -187,7 +191,10 @@ bool discover() {
   i_clock = need_field(t_clock, "_Instance");
   i_record = need_field(t_record, "_Instance");
 
-  f_state = need_field(t_main_flow, "_CurrentMainState");
+  // The main state: a field of its own in the current build, the auto-property's
+  // backing field in the dx11_non-rt build - both what MainStateValue reads.
+  f_state = t_main_flow ? re::find_field(t_main_flow, "_CurrentMainState") : re::Field{};
+  if (!f_state.valid()) f_state = need_field(t_main_flow, "<MainStateValue>k__BackingField");
   f_header = need_field(t_main_flow, "gameHeaderSaveData");
   f_save_times = need_field(t_header, "SaveTimes");
   f_player_list = need_field(t_player_mgr, "PlayerList");
@@ -295,8 +302,16 @@ bool discover() {
   // puts in a slot records no ammo, as an empty weapon does.
   f_pc_overwrite_kind = t_parts_combo ? re::find_field(t_parts_combo, "_OverwriteKind") : re::Field{};
   f_pc_kind = t_parts_combo ? re::find_field(t_parts_combo, "_Kind") : re::Field{};
-  g_bullet_item_code =
-      t_equip_define ? re::method_code_typed(t_equip_define, "getItemID", {"app.ropeway.EquipmentDefine.Bullet"}) : 0;
+  // A static method: the lookup must say so, or it finds nothing (find_method
+  // matches static-ness). Until 2026-09-25 it did not, so every weapon the editor
+  // made recorded no ammo type and the game could never reload it.
+  g_bullet_item_code = t_equip_define ? re::method_code_typed(t_equip_define, "getItemID",
+                                                              {"app.ropeway.EquipmentDefine.Bullet"}, true)
+                                      : 0;
+  if (!g_bullet_item_code || !f_pc_overwrite_kind.valid() || !f_pc_kind.valid())
+    logf("game: the ammo a weapon takes cannot be worked out (getItemID %s, _OverwriteKind %d, _Kind %d): a weapon "
+         "the inventory editor makes will record no ammo type, and the game cannot reload such a weapon",
+         g_bullet_item_code ? "found" : "not found", f_pc_overwrite_kind.valid(), f_pc_kind.valid());
 
   // Stacks (the item box's Store): which items stack - ItemManager.<ItemElementTable>,
   // filled as the game starts and read when an item is stored - and how far:
@@ -511,6 +526,22 @@ bool discover() {
   f_use_reuse = need_field(t_use_data, "CanReuse");
   if (const uint32_t e = re::find_type("app.ropeway.gamemastering.InventoryManager.STOCK_TYPE"))
     k_stock_item = re::enum_value(e, "ITEM", k_stock_item);
+  // The dx11_non-rt build makes the enemy's hit handlers, the typewriter's checks and
+  // the use-item callbacks above as `lea r9,[code]` delegates, which no exchanged
+  // pointer reaches: there One hit kills, Save without ink ribbons and Infinite
+  // wooden boards are heard at virtual methods instead (events.cpp). Looked up in
+  // either build (never missing-counted); hooked in that one only.
+  t_think = re::find_type("app.ropeway.enemy.EnemyThinkBehavior");
+  f_think_controller = t_think ? re::find_field(t_think, "<Controller>k__BackingField") : re::Field{};
+  ev.think = t_think;
+  ev.think_damage = t_think ? re::find_method(t_think, "onHitDamage", {kDamageInfo}) : 0;
+  ev.typewriter_funcs =
+      t_typewriter ? re::find_method(t_typewriter, "getTriggerFuncCheckValid", {"app.ropeway.gimmick.action.Trigger"}) : 0;
+  t_use_trigger = re::find_type("app.ropeway.gimmick.action.TriggerUseItem");
+  f_trigger_items = t_use_trigger ? re::find_field(t_use_trigger, "Items") : re::Field{};
+  f_trigger_useless = t_use_trigger ? re::find_field(t_use_trigger, "UselessItems") : re::Field{};
+  ev.use_trigger = t_use_trigger;
+  ev.use_check = t_use_trigger ? re::find_method(t_use_trigger, "checkValid", {"System.Boolean"}) : 0;
   // The records' counters move inside three of the game's calls, all virtual: the
   // item box's FSM action opening it (SwitchItemToInventory.update, the only caller
   // of GUIMaster.openInventoryItemBoxMode), the inventory screen's frame
@@ -585,6 +616,9 @@ bool discover() {
   p.equipped = p.bag && t_equipment && f_eq_condition.valid() && f_cond_inventory.valid() && f_inv_main_slot.valid() &&
                f_inv_sub_slot.valid();
   p.measure = p.clock && f_clock_measure.valid();
+  p.ammo = t_bullet_ud && f_bullet_ud.valid() && f_bullet_combos.valid() && t_weapon_combo && f_wc_type.valid() &&
+           f_wc_combos.valid() && t_parts_combo && f_pc_parts.valid() && f_pc_priority.valid() &&
+           f_pc_overwrite_kind.valid() && f_pc_kind.valid() && g_bullet_item_code != 0;
   p.stacks = stacking > 0 && t_item_mgr && i_item_mgr.valid() && f_item_table.valid() && t_item_table &&
              f_table_entries.valid() && f_table_count.valid() && t_item_entry && f_entry_hash.valid() &&
              f_entry_key.valid() && f_entry_value.valid() && t_item_element && f_elem_disposable.valid();
@@ -596,12 +630,13 @@ bool discover() {
   p.steps = t_player_mgr && i_player_mgr.valid() && f_pedometer.valid();
   logf("game: discovery %s (%d name(s) missing): flow %d, players %d, enemies %d, records %d, header %d, clock %d, "
        "inventory %d, item box %d, two-slot items %d (and weapons with parts 0x%X), typewriters %d, knives %d, "
-       "damage %d, plants %d, equipped weapons %d, play-time flag %d, countdown %d, stacks %d (%d items stack above 1), "
+       "weapon ammo %d, damage %d, plants %d, equipped weapons %d, play-time flag %d, countdown %d, stacks %d (%d "
+       "items stack above 1), "
        "use-item callbacks %d, difficulty %d, record counters %d%d%d (item box, recovery items, steps); MainState "
        "IN_GAME=%d PAUSE=%d TITLE=%d, ink ribbon id %d, wooden boards id %d, %d inventory slots a row, Difficulty "
        "EASY=%d NORMAL=%d HARD=%d, ProgressType WALK=%d",
        p.flow ? "done" : "FAILED", g_missing, p.flow, p.players, p.enemies, p.records, p.header, p.clock, p.bag, p.box,
-       p.fat, k_fat_parts, p.typewriter, knives, p.damage, p.plants, p.equipped, p.measure, p.countdown, p.stacks,
+       p.fat, k_fat_parts, p.typewriter, knives, p.ammo, p.damage, p.plants, p.equipped, p.measure, p.countdown, p.stacks,
        stacking, p.boards, p.difficulty, p.item_box_count, p.heal_count, p.steps, k_in_game, k_pause, k_title, k_ink,
        k_boards, k_columns, k_easy, k_normal, k_hard, k_walk);
   g_ready = p.flow;
@@ -1102,10 +1137,11 @@ bool is_melee_weapon(int weapon_id) {
 
 // What one weapon's entry in WeaponBulletUserData says for the parts it has:
 // how many rounds it holds (`count`, -1 unlimited) and which ammo it takes
-// (`kind`, an EquipmentDefine.Bullet; 0 when the entry names none - a knife, a
-// grenade). Among the entries whose parts the weapon has, the lowest _Priority
-// that overwrites the figure wins, each figure on its own
-// (WeaponLoadingpartsCombination.getNumber and getKind).
+// (`kind`, an EquipmentDefine.Bullet; 0 when no entry names one - a knife, a
+// grenade) - the game's own two-pass rule over its LoadingPartsCombinations
+// (pick_combo, game.h: WeaponLoadingpartsCombination.getNumber and getKind).
+// The entries are read as they are; an entry that cannot be read is left out,
+// as the game's lambdas skip nothing the mod could stand in for.
 static void read_combo(int weapon_id, int parts, int* count, uint32_t* kind) {
   *count = 0;
   *kind = 0;
@@ -1120,28 +1156,28 @@ static void read_combo(int weapon_id, int parts, int* count, uint32_t* kind) {
     if (!wc || !re::is_a(wc, t_weapon_combo) || !get(wc, f_wc_type, &type) || type != weapon_id) continue;
     re::Array combos;
     if (!re::read_array(ref(wc, f_wc_combos), &combos) || combos.elem_size != 8) return;
-    int32_t best = INT32_MAX, best_kind = INT32_MAX;
-    for (int k = 0; k < combos.count && k < 256; ++k) {
+    ComboEntry entries[64];
+    int n = 0;
+    const bool kinds = f_pc_overwrite_kind.valid() && f_pc_kind.valid();
+    for (int k = 0; k < combos.count && n < 64; ++k) {
       const uintptr_t pc = mem::read_ptr(combos.data + static_cast<uintptr_t>(k) * 8);
-      uint32_t cparts = 0;
-      int32_t prio = 0, number = 0;
-      uint8_t overwrite = 0, infinity = 0;
-      if (!pc || !re::is_a(pc, t_parts_combo) || !get(pc, f_pc_parts, &cparts) || !get(pc, f_pc_priority, &prio) ||
-          !get(pc, f_pc_overwrite, &overwrite) || !get(pc, f_pc_infinity, &infinity) || !get(pc, f_pc_number, &number))
+      ComboEntry e;
+      int32_t prio = 0;
+      uint8_t overwrite = 0, infinity = 0, overwrite_kind = 0;
+      if (!pc || !re::is_a(pc, t_parts_combo) || !get(pc, f_pc_parts, &e.parts) || !get(pc, f_pc_priority, &prio) ||
+          !get(pc, f_pc_overwrite, &overwrite) || !get(pc, f_pc_infinity, &infinity) || !get(pc, f_pc_number, &e.number))
         continue;
-      if ((static_cast<uint32_t>(parts) & cparts) != cparts) continue;
-      if (overwrite && prio < best) {
-        best = prio;
-        *count = infinity ? -1 : number;
-      }
-      uint8_t overwrite_kind = 0;
-      uint32_t this_kind = 0;
-      if (f_pc_overwrite_kind.valid() && f_pc_kind.valid() && get(pc, f_pc_overwrite_kind, &overwrite_kind) &&
-          overwrite_kind && prio < best_kind && get(pc, f_pc_kind, &this_kind)) {
-        best_kind = prio;
-        *kind = this_kind;
-      }
+      if (kinds && (!get(pc, f_pc_overwrite_kind, &overwrite_kind) || !get(pc, f_pc_kind, &e.kind))) continue;
+      e.priority = prio;
+      e.overwrite_number = overwrite != 0;
+      e.infinity = infinity != 0;
+      e.overwrite_kind = kinds && overwrite_kind != 0;
+      if (!kinds) e.kind = 0;
+      entries[n++] = e;
     }
+    const ComboPick pick = pick_combo(entries, n, static_cast<uint32_t>(parts));
+    *count = pick.count;
+    *kind = pick.kind;
     return;
   }
 }
@@ -1150,13 +1186,14 @@ static void read_combo(int weapon_id, int parts, int* count, uint32_t* kind) {
 // tick and the game's threads (a knife's hit) both ask.
 struct KnownWeapon {
   int weapon, parts, count, bullet;
+  uint32_t kind;
 };
 static KnownWeapon g_known[64];
 static int g_known_n = 0;
 
 static KnownWeapon weapon_info(int weapon_id, int parts) {
   AcquireSRWLockShared(&g_full_lock);
-  KnownWeapon k{weapon_id, parts, 0, 0};
+  KnownWeapon k{weapon_id, parts, 0, 0, 0};
   bool found = false;
   for (int i = 0; i < g_known_n && !found; ++i)
     if (g_known[i].weapon == weapon_id && g_known[i].parts == parts) k = g_known[i], found = true;
@@ -1164,6 +1201,7 @@ static KnownWeapon weapon_info(int weapon_id, int parts) {
   if (found) return k;
   uint32_t kind = 0;
   read_combo(weapon_id, parts, &k.count, &kind);
+  k.kind = kind;
   // The ammo item of that kind, through the game's own EquipmentDefine.getItemID.
   // A weapon that takes more than one kind has them as one set of flags, which
   // that method does not name: the lowest kind it does name is the one a fresh
@@ -1191,13 +1229,17 @@ static KnownWeapon weapon_info(int weapon_id, int parts) {
   for (int i = 0; i < g_known_n && !again; ++i) again = g_known[i].weapon == weapon_id && g_known[i].parts == parts;
   if (!again && g_known_n < static_cast<int>(sizeof(g_known) / sizeof(g_known[0]))) g_known[g_known_n++] = k;
   ReleaseSRWLockExclusive(&g_full_lock);
-  if (!again) logf("game: weapon %d (parts 0x%X) is full at %d, loaded with item %d", weapon_id, parts, k.count, k.bullet);
+  if (!again)
+    logf("game: weapon %d (parts 0x%X) is full at %d, takes ammo kind 0x%X = item %d", weapon_id, parts, k.count, k.kind,
+         k.bullet);
   return k;
 }
 
 int weapon_full_count(int weapon_id, int parts) { return weapon_info(weapon_id, parts).count; }
 
 int weapon_bullet_id(int weapon_id, int parts) { return weapon_info(weapon_id, parts).bullet; }
+
+uint32_t weapon_bullet_kind(int weapon_id, int parts) { return weapon_info(weapon_id, parts).kind; }
 
 // --- difficulty -------------------------------------------------------------------------------------------------------
 static uintptr_t header() {
@@ -1424,6 +1466,43 @@ int make_lethal(uintptr_t hpc, uintptr_t enemy, uintptr_t info) {
   return hp;
 }
 
+uintptr_t think_controller(uintptr_t think) {
+  if (!think || !t_think || !f_think_controller.valid() || !re::is_a(think, t_think)) return 0;
+  const uintptr_t enemy = ref(think, f_think_controller);
+  return enemy && re::is_a(enemy, t_enemy_ctl) ? enemy : 0;
+}
+
+int make_lethal_after(uintptr_t hpc, uintptr_t enemy, uintptr_t info) {
+  if (!g_parts.damage || !hpc || !info || !re::is_a(info, t_damage_info)) return -1;
+  int32_t damage = 0, hp = 0;
+  uint8_t no_damage = 0;
+  // A hit that did damage and left the enemy standing; the same holds as make_lethal's.
+  if (!get(info, f_di_damage, &damage) || damage <= 0 || !get(hpc, f_hp_cur, &hp) || hp <= 0) return -1;
+  if (get(hpc, f_hp_nodamage, &no_damage) && no_damage) return -1;
+  if (enemy_flagged(enemy, g_keep_alive)) return -1;
+  if (!put<int32_t>(hpc, f_hp_cur, 0)) return -1;
+  put<uint8_t>(info, f_di_kill, 1);
+  return hp;
+}
+
+int wither_plant_after(uintptr_t enemy, uintptr_t hpc, uintptr_t info) {
+  if (!g_parts.plants || !enemy || !hpc || !info || !re::is_a(info, t_damage_info)) return kNotAPlant;
+  const uintptr_t think = ref(enemy, f_enemy_think);
+  if (!think || !re::is_a(think, t_em5000_think)) return kNotAPlant;
+  if (enemy_flagged(enemy, g_stop_damage)) return kPlantLeftAlone;
+  int32_t damage = 0, hp = 0;
+  if (!get(info, f_di_damage, &damage) || damage <= 0 || !get(hpc, f_hp_cur, &hp)) return kPlantLeftAlone;
+  const uintptr_t flame = ref(think, f_think_flame);
+  int32_t left = 0;
+  if (!flame || !re::is_a(flame, t_flame_hp) || !get(flame, f_flame_cur, &left)) return kPlantLeftAlone;
+  // An empty flame-only health: burning up already, or dead - this hit starts nothing.
+  if (left <= 0 || !put<int32_t>(flame, f_flame_cur, 0)) return kPlantLeftAlone;
+  // The plant's own onHitDamage (next) burns it up only while it is alive: a hit that
+  // took the health to 0 has it brought back to 1, and forceDead takes it from there.
+  if (hp <= 0) put<int32_t>(hpc, f_hp_cur, 1);
+  return kPlantBurned;
+}
+
 int wither_plant(uintptr_t enemy, uintptr_t hpc, uintptr_t info) {
   if (!g_parts.plants || !enemy || !hpc || !info || !re::is_a(info, t_damage_info)) return kNotAPlant;
   const uintptr_t think = ref(enemy, f_enemy_think);
@@ -1542,13 +1621,9 @@ std::atomic<uintptr_t> g_board_marks[kBoardMarks];
 std::atomic<unsigned> g_board_mark_next{0};
 }  // namespace
 
-int mark_boards_reusable(uintptr_t closure, bool keep) {
-  if (!g_parts.boards || !closure) return 0;
-  uintptr_t work = 0;
-  for (int i = 0; i < 2 && !work; ++i)
-    if (t_use_closure[i] && f_closure_work[i].valid() && re::is_a(closure, t_use_closure[i]))
-      work = ref(closure, f_closure_work[i]);
-  const uintptr_t data = work && re::is_a(work, t_item_work) ? ref(work, f_work_data) : 0;
+namespace {
+// One TriggerUseItem.ItemData: marked reusable (1), a mark of the mod's taken off (-1), or not (0).
+int mark_board_data(uintptr_t data, bool keep) {
   int32_t stock = -1, item = 0;
   uint8_t reuse = 0;
   if (!data || !re::is_a(data, t_use_data) || !get(data, f_use_stock, &stock) || stock != k_stock_item ||
@@ -1568,6 +1643,28 @@ int mark_boards_reusable(uintptr_t closure, bool keep) {
     if (m.compare_exchange_strong(expect, 0)) return put<uint8_t>(data, f_use_reuse, 0) ? -1 : 0;
   }
   return 0;  // reusable as the game made it
+}
+}  // namespace
+
+int mark_boards_reusable(uintptr_t closure, bool keep) {
+  if (!g_parts.boards || !closure) return 0;
+  uintptr_t work = 0;
+  for (int i = 0; i < 2 && !work; ++i)
+    if (t_use_closure[i] && f_closure_work[i].valid() && re::is_a(closure, t_use_closure[i]))
+      work = ref(closure, f_closure_work[i]);
+  return mark_board_data(work && re::is_a(work, t_item_work) ? ref(work, f_work_data) : 0, keep);
+}
+
+int mark_trigger_boards(uintptr_t trigger, bool keep) {
+  if (!g_parts.boards || !trigger || !t_use_trigger || !re::is_a(trigger, t_use_trigger)) return 0;
+  int done = 0;
+  for (const re::Field* f : {&f_trigger_items, &f_trigger_useless}) {
+    re::List l;
+    if (!f->valid() || !re::read_list(ref(trigger, *f), &l)) continue;
+    for (int i = 0; i < l.count; ++i)
+      if (const int d = mark_board_data(re::list_ref(l, i), keep)) done = d;
+  }
+  return done;
 }
 
 void forget_board_marks() {

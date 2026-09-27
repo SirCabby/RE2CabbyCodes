@@ -19,6 +19,14 @@
 namespace {
 
 int g_fail = 0;
+bool g_rt = true;  // TDB 70 (build 11636119); false: TDB 66 (the dx11_non-rt build 11055033)
+
+// A type or method index the RT build's file has (tools/tdb_dump.py prints it):
+// exactly that there; in the dx11_non-rt build, which numbers everything its own
+// way, only that it is found.
+bool index_is(uint32_t got, uint32_t rt) { return g_rt ? got == rt : got != 0; }
+// A vtable slot, likewise: the dx11_non-rt build's classes have their own.
+bool slot_is(int got, int rt) { return g_rt ? got == rt : got >= 0; }
 
 void check(bool ok, const char* what) {
   std::printf("%s  %s\n", ok ? "ok  " : "FAIL", what);
@@ -68,16 +76,24 @@ int main(int argc, char** argv) {
   std::fread(sec.data(), 1, sec.size(), f);
   std::fclose(f);
   size_t at = 0;
-  for (; at + 8 < sec.size(); at += 8)
-    if (!std::memcmp(&sec[at], "TDB\0", 4) && *reinterpret_cast<uint32_t*>(&sec[at + 4]) == 70) break;
-  check(at + 8 < sec.size(), "TDB v70 header found in .data");
-  // Copy from the header to the end of the section and rebase the 18 array
-  // offsets into pointers, as the VM does.
+  uint32_t version = 0;
+  for (; at + 8 < sec.size(); at += 8) {
+    if (std::memcmp(&sec[at], "TDB\0", 4)) continue;
+    version = *reinterpret_cast<uint32_t*>(&sec[at + 4]);
+    if (version == 70 || version == 66) break;
+  }
+  check(at + 8 < sec.size(), "a TDB v70 or v66 header found in .data");
+  if (at + 8 >= sec.size()) return 1;
+  g_rt = version == 70;
+  std::printf("TDB v%u: %s\n", version, g_rt ? "the ray-tracing build" : "the dx11_non-rt build");
+  // Copy from the header to the end of the section and rebase the array offsets
+  // into pointers, as the VM does: 18 from 0x58 (TDB 70), 13 from 0x48 (TDB 66).
   const size_t len = sec.size() - at;
   auto* tdb = static_cast<uint8_t*>(VirtualAlloc(nullptr, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
   std::memcpy(tdb, &sec[at], len);
-  for (int i = 0; i < 18; ++i) {
-    auto* p = reinterpret_cast<uint64_t*>(tdb + 0x58 + 8 * i);
+  const int first_array = g_rt ? 0x58 : 0x48, arrays = g_rt ? 18 : 13;
+  for (int i = 0; i < arrays; ++i) {
+    auto* p = reinterpret_cast<uint64_t*>(tdb + first_array + 8 * i);
     if (*p) *p += reinterpret_cast<uint64_t>(tdb);
   }
   *reinterpret_cast<uint32_t*>(tdb + 8) = 1;
@@ -85,11 +101,11 @@ int main(int argc, char** argv) {
   std::printf("status: %s, %u types\n", re2cc::re::status(), re2cc::re::num_types());
 
   using namespace re2cc;
-  check(re::find_type("via.GameObject") == 62370, "via.GameObject is type 62370");
-  check(re::find_type("app.ropeway.gamemastering.InventoryManager") == 45819, "InventoryManager is type 45819");
-  check(re::find_type("app.ropeway.gamemastering.InventoryManager.PrimitiveItem") == 12194, "nested PrimitiveItem");
-  check(re::find_type("System.Collections.Generic.List`1<app.ropeway.inventory.Slot>") == 36696, "List<Slot> by name");
-  check(re::full_name(re::parent(45819)) ==
+  check(index_is(re::find_type("via.GameObject"), 62370), "via.GameObject is type 62370");
+  check(index_is(re::find_type("app.ropeway.gamemastering.InventoryManager"), 45819), "InventoryManager is type 45819");
+  check(index_is(re::find_type("app.ropeway.gamemastering.InventoryManager.PrimitiveItem"), 12194), "nested PrimitiveItem");
+  check(index_is(re::find_type("System.Collections.Generic.List`1<app.ropeway.inventory.Slot>"), 36696), "List<Slot> by name");
+  check(re::full_name(re::parent(re::find_type("app.ropeway.gamemastering.InventoryManager"))) ==
             "app.ropeway.RopewaySingletonBehaviorRoot`1<app.ropeway.gamemastering.InventoryManager>",
         "InventoryManager's parent is its singleton root");
   check_field("app.ropeway.gamemastering.InventoryManager", "<CurrentInventory>k__BackingField", 0x0);
@@ -114,8 +130,11 @@ int main(int argc, char** argv) {
   check_field("app.ropeway.GameClock.GameSaveData", "_GameElapsedTime", 0x8);
   check_field("app.ropeway.GameClock.GameSaveData", "_PauseSpendingTime", 0x20);
   check_field("app.ropeway.gamemastering.RecordManager", "<CurrentSaveCount>k__BackingField", 0x8);
-  check_field("app.ropeway.gamemastering.MainFlowManager", "_CurrentMainState", 0x8C);
-  check_field("app.ropeway.gamemastering.MainFlowManager", "gameHeaderSaveData", 0x150);
+  // The main state: its own field in the RT build, an auto-property's backing
+  // field in the dx11_non-rt build (both are what MainStateValue reads).
+  if (g_rt) check_field("app.ropeway.gamemastering.MainFlowManager", "_CurrentMainState", 0x8C);
+  else check_field("app.ropeway.gamemastering.MainFlowManager", "<MainStateValue>k__BackingField", 0x84);
+  check_field("app.ropeway.gamemastering.MainFlowManager", "gameHeaderSaveData", g_rt ? 0x150 : 0x148);
   check_field("app.ropeway.gamemastering.MainFlowManager.GameHeaderSaveData", "SaveTimes", 0x14);
   check_field("app.ropeway.gamemastering.ItemLockerManager", "gameSaveData", 0x18);
   check_field("app.ropeway.gimmick.action.GimmickItemLockerControl.ItemLockerSaveData", "_Items", 0x0);
@@ -142,24 +161,56 @@ int main(int argc, char** argv) {
   const uint32_t im = re::find_type("app.ropeway.gamemastering.InventoryManager");
   const uint32_t inv = re::find_type("app.ropeway.survivor.Inventory");
   const uint32_t item_data = re::find_type("app.ropeway.gamemastering.InventoryManager.ItemData");
-  check(re::find_method(im, "setStock", {"System.Int32", "app.ropeway.gamemastering.InventoryManager.StockItem"}) == 121814,
+  check(index_is(re::find_method(im, "setStock", {"System.Int32", "app.ropeway.gamemastering.InventoryManager.StockItem"}), 121814),
         "InventoryManager.setStock(Int32, StockItem) is method 121814");
-  check(re::find_method(im, "removeStock", {"System.Int32"}) == 121819, "InventoryManager.removeStock(Int32) is method 121819");
-  check(re::find_method(im, "putShortcutWeapon", {"System.Int32"}) == 121876,
+  check(index_is(re::find_method(im, "removeStock", {"System.Int32"}), 121819), "InventoryManager.removeStock(Int32) is method 121819");
+  check(index_is(re::find_method(im, "putShortcutWeapon", {"System.Int32"}), 121876),
         "InventoryManager.putShortcutWeapon(Int32) is method 121876");
-  check(re::find_method(im, "updateInventoryFlags", {}) == 121850, "InventoryManager.updateInventoryFlags() is method 121850");
-  check(re::find_method(inv, "unequipSlot", {"System.Int32"}) == 121054, "Inventory.unequipSlot(Int32) is method 121054");
-  check(re::find_method(item_data, "setData", {"app.ropeway.gamemastering.InventoryManager.ItemData"}) == 5865,
+  check(index_is(re::find_method(im, "updateInventoryFlags", {}), 121850), "InventoryManager.updateInventoryFlags() is method 121850");
+  check(index_is(re::find_method(inv, "unequipSlot", {"System.Int32"}), 121054), "Inventory.unequipSlot(Int32) is method 121054");
+  check(index_is(re::find_method(item_data, "setData", {"app.ropeway.gamemastering.InventoryManager.ItemData"}), 5865),
         "ItemData.setData(ItemData) is method 5865, not its 3-parameter overload");
-  check(re::find_method(item_data, "setBlank", {}) == 5861, "ItemData.setBlank() is method 5861");
+  check(index_is(re::find_method(item_data, "setBlank", {}), 5861), "ItemData.setBlank() is method 5861");
   check(re::find_method(item_data, "setData", {"System.Int32"}) == 0, "no ItemData.setData(Int32)");
   check(re::find_method(im, "setStock", {"System.Int32", "app.ropeway.gamemastering.InventoryManager.StockItem"}, true) == 0,
         "setStock is not static");
   // Two-slot weapons (game.cpp reads the parts out of its code).
-  check(re::find_method(im, "isFatWeapon",
-                        {"app.ropeway.EquipmentDefine.WeaponType", "app.ropeway.EquipmentDefine.WeaponParts"}, true) == 121908,
+  check(index_is(re::find_method(im, "isFatWeapon",
+                        {"app.ropeway.EquipmentDefine.WeaponType", "app.ropeway.EquipmentDefine.WeaponParts"}, true), 121908),
         "InventoryManager.isFatWeapon(WeaponType, WeaponParts) is static method 121908");
   check(re::enum_value(re::find_type("app.ropeway.EquipmentDefine.WeaponParts"), "A", -1) == 1, "WeaponParts.A = 1");
+
+  // The ammo a weapon takes (game.cpp, the inventory editor's weapons): the kind
+  // fields beside the number in WeaponBulletUserData's entries, and
+  // EquipmentDefine.getItemID, which is static - find_method matches static-ness,
+  // so a lookup that does not say so finds nothing. The mod's did not until
+  // 2026-09-25: every weapon it made recorded no ammo type (BulletId 0), which
+  // the game's reload reads first (Inventory.getReloadableBulletMainSlot answers
+  // 0 rounds for it), so none of them could be reloaded.
+  const uint32_t equip_define = re::find_type("app.ropeway.EquipmentDefine");
+  check(index_is(re::find_method(equip_define, "getItemID", {"app.ropeway.EquipmentDefine.Bullet"}, true), 121953),
+        "EquipmentDefine.getItemID(Bullet) is static method 121953");
+  check(re::find_method(equip_define, "getItemID", {"app.ropeway.EquipmentDefine.Bullet"}) == 0,
+        "getItemID is not found as an instance method - the lookup must say static");
+  check(index_is(re::find_method(equip_define, "getBulletType", {"app.ropeway.gamemastering.Item.ID"}, true), 121952),
+        "EquipmentDefine.getBulletType(Item.ID) is static method 121952 (its inverse)");
+  check_field("app.ropeway.WeaponPartsCombinationBase", "_Priority", 0x0);
+  check_field("app.ropeway.WeaponPartsCombinationBase", "_Parts", 0x4);
+  check_field("app.ropeway.WeaponBulletUserData.LoadingPartsCombination", "_OverwriteNumber", 0x8);
+  check_field("app.ropeway.WeaponBulletUserData.LoadingPartsCombination", "_Infinity", 0x9);
+  check_field("app.ropeway.WeaponBulletUserData.LoadingPartsCombination", "_Number", 0x38);
+  check_field("app.ropeway.WeaponBulletUserData.LoadingPartsCombination", "_OverwriteKind", 0x3C);
+  check_field("app.ropeway.WeaponBulletUserData.LoadingPartsCombination", "_Kind", 0x40);
+  {
+    const uint32_t bullet = re::find_type("app.ropeway.EquipmentDefine.Bullet");
+    check(re::enum_value(bullet, "Handgun", -1) == 1 && re::enum_value(bullet, "Shotgun", -1) == 2 &&
+              re::enum_value(bullet, "AcidGrenade", -1) == 16 && re::enum_value(bullet, "FireGrenade", -1) == 32,
+          "Bullet Handgun = 1, Shotgun = 2, AcidGrenade = 16, FireGrenade = 32 (flags)");
+    // The fields read for the inventory editor's weapons: the combination's
+    // base class declares the priority and the parts, the entry the rest.
+    const re::Field prio = re::find_field(re::find_type("app.ropeway.WeaponBulletUserData.LoadingPartsCombination"), "_Priority");
+    check(prio.valid() && prio.offset == 0x0, "_Priority is found on LoadingPartsCombination through its base class");
+  }
 
   // Stacks (game.cpp): the item table as a Dictionary<Item.ID, ItemElement> - its
   // generic instance, the nested Entry struct - and the maximum's method, whose
@@ -181,7 +232,7 @@ int main(int argc, char** argv) {
         "item.Disposable.MultipleUse = 2");
   check(re::enum_value(item, "MAX", -1) == 297, "Item.ID.MAX = 297");
   const uint32_t item_mgr = re::find_type("app.ropeway.gamemastering.ItemManager");
-  check(re::find_method(item_mgr, "getItemMultipleUseMax", {"app.ropeway.gamemastering.Item.ID"}) == 354617,
+  check(index_is(re::find_method(item_mgr, "getItemMultipleUseMax", {"app.ropeway.gamemastering.Item.ID"}), 354617),
         "ItemManager.getItemMultipleUseMax(Item.ID) is instance method 354617");
 
   // Wooden boards (game.cpp, events.cpp): the callbacks TriggerUseItem.registerUseMode
@@ -197,9 +248,9 @@ int main(int argc, char** argv) {
   check_field("app.ropeway.gimmick.action.TriggerUseItem.ItemData", "Stock", 0x8);
   check_field("app.ropeway.gimmick.action.TriggerUseItem.ItemData", "ItemId", 0xC);
   check_field("app.ropeway.gimmick.action.TriggerUseItem.ItemData", "CanReuse", 0x1C);
-  check(re::find_method(re::find_type(kUseClosure0), "<registerUseMode>b__0", {}) == 380469,
+  check(index_is(re::find_method(re::find_type(kUseClosure0), "<registerUseMode>b__0", {}), 380469),
         "TriggerUseItem's use-item callback <registerUseMode>b__0() is method 380469");
-  check(re::find_method(re::find_type(kUseClosure1), "<registerUseMode>b__1", {}) == 380471,
+  check(index_is(re::find_method(re::find_type(kUseClosure1), "<registerUseMode>b__1", {}), 380471),
         "TriggerUseItem's useless-item callback <registerUseMode>b__1() is method 380471");
 
   // The difficulty switch (game.cpp, call.cpp): the header's difficulty, the game
@@ -213,7 +264,7 @@ int main(int argc, char** argv) {
   check_field("app.ropeway.gamemastering.MainFlowManager", "<ForceEasyContinue>k__BackingField", 0x68);
   check_field("app.ropeway.gamemastering.GlobalUserDataManager", "_Instance", 0x0, true);
   const uint32_t main_flow = re::find_type("app.ropeway.gamemastering.MainFlowManager");
-  check(re::find_method(main_flow, "setDifficulty", {"app.ropeway.gamemastering.MainFlowManager.Difficulty"}) == 99149,
+  check(index_is(re::find_method(main_flow, "setDifficulty", {"app.ropeway.gamemastering.MainFlowManager.Difficulty"}), 99149),
         "MainFlowManager.setDifficulty(Difficulty) is instance method 99149");
   check(re::find_method(main_flow, "setDifficulty", {"app.ropeway.gamemastering.MainFlowManager.Difficulty"}, true) == 0,
         "setDifficulty is not static");
@@ -235,15 +286,15 @@ int main(int argc, char** argv) {
   {
     const uint32_t box = re::find_method(re::find_type("app.ropeway.fsmv2.SwitchItemToInventory"), "update",
                                          {"via.behaviortree.ActionArg"});
-    check(box == 369956 && re::method_vt_index(box) == 9,
+    check(index_is(box, 369956) && slot_is(re::method_vt_index(box), 9),
           "SwitchItemToInventory.update(ActionArg) is method 369956, virtual[9]");
     const uint32_t screen = re::find_method(re::find_type("app.ropeway.gui.NewInventorySlotBehavior"), "update", {});
-    check(screen == 96410 && re::method_vt_index(screen) == 15,
+    check(index_is(screen, 96410) && slot_is(re::method_vt_index(screen), 15),
           "NewInventorySlotBehavior.update() is method 96410, virtual[15]");
     const uint32_t land = re::find_method(re::find_type("app.ropeway.PlayerFootEffectController"), "onLand",
                                           {"via.motion.script.FootEffectController.JointPartsType",
                                            "via.motion.script.FootEffectController.JointSideType", "via.vec3"});
-    check(land == 52305 && re::method_vt_index(land) == 19,
+    check(index_is(land, 52305) && slot_is(re::method_vt_index(land), 19),
           "PlayerFootEffectController.onLand(JointPartsType, JointSideType, vec3) is method 52305, virtual[19]");
   }
 
@@ -254,9 +305,9 @@ int main(int argc, char** argv) {
   {
     const uint32_t action = re::find_type("app.ropeway.fsmv2.EndMeasureAndRecordGameElapsedTimeForExtra");
     const uint32_t start = re::find_method(action, "start", {"via.behaviortree.ActionArg"});
-    check(start == 369564 && re::method_vt_index(start) == 8,
+    check(index_is(start, 369564) && slot_is(re::method_vt_index(start), 8),
           "EndMeasureAndRecordGameElapsedTimeForExtra.start(ActionArg) is method 369564, virtual[8]");
-    check(re::find_method(re::find_type("via.behaviortree.Action"), "start", {"via.behaviortree.ActionArg"}) == 65295,
+    check(index_is(re::find_method(re::find_type("via.behaviortree.Action"), "start", {"via.behaviortree.ActionArg"}), 65295),
           "the base via.behaviortree.Action.start is a different method (65295): the action's own is hooked");
   }
 
@@ -267,7 +318,7 @@ int main(int argc, char** argv) {
   {
     const uint32_t rogue = re::find_type("app.ropeway.gui.RogueCountDownBehavior");
     const uint32_t late = re::find_method(rogue, "lateUpdate", {});
-    check(late == 248804 && re::method_vt_index(late) == 6,
+    check(index_is(late, 248804) && slot_is(re::method_vt_index(late), 6),
           "RogueCountDownBehavior.lateUpdate() is method 248804, virtual[6]");
     const uint32_t main_late = re::find_method(re::find_type("app.ropeway.gui.CountDownBehavior"), "lateUpdate", {});
     check(main_late && main_late != late,
@@ -325,8 +376,8 @@ int main(int argc, char** argv) {
     check_field("app.ropeway.GimmickDialLockManager.SystemSaveData", "LockRecordList", 0x8);
     check(re::value_size(re::find_type("app.ropeway.GimmickDialLockManager.LockData")) == 1,
           "a lock's LockData is one byte (the bool records.cpp clears)");
-    check(re::find_method(re::find_type("app.ropeway.GimmickDialLockManager"), "SetUnlockRecord",
-                          {"app.ropeway.GimmickDialLockManager.RecordDialLock"}) == 258510,
+    check(index_is(re::find_method(re::find_type("app.ropeway.GimmickDialLockManager"), "SetUnlockRecord",
+                          {"app.ropeway.GimmickDialLockManager.RecordDialLock"}), 258510),
           "GimmickDialLockManager.SetUnlockRecord(RecordDialLock) is method 258510");
     check_field("app.ropeway.gamemastering.RogueAccessoryManager", "rogueSystemSaveData", 0x0);
     check_field("app.ropeway.gamemastering.RogueAccessoryManager.RogueSystemSaveData", "AccessoryEquipSettings", 0x8);
@@ -339,9 +390,14 @@ int main(int argc, char** argv) {
     check_field(kSdm, "SlotId", 0x3C);
     check_field(kSdm, "<saveLoadStep>k__BackingField", 0x5C);
     const uint32_t step = re::find_type("app.ropeway.gamemastering.SaveDataManager.SaveLoadStep");
-    check(re::enum_value(step, "INITIALIZE", -1) == 0 && re::enum_value(step, "REQUEST_WAIT", -1) == 1 &&
-              re::enum_value(step, "PS5_CROSSSAVE_DIALOG", -1) == 15,
-          "SaveLoadStep INITIALIZE 0, REQUEST_WAIT 1, PS5_CROSSSAVE_DIALOG 15 (get_IsBusy's idle steps)");
+    if (g_rt)
+      check(re::enum_value(step, "INITIALIZE", -1) == 0 && re::enum_value(step, "REQUEST_WAIT", -1) == 1 &&
+                re::enum_value(step, "PS5_CROSSSAVE_DIALOG", -1) == 15,
+            "SaveLoadStep INITIALIZE 0, REQUEST_WAIT 1, PS5_CROSSSAVE_DIALOG 15 (get_IsBusy's idle steps)");
+    else
+      check(re::enum_value(step, "INITIALIZE", -1) == 0 && re::enum_value(step, "REQUEST_WAIT", -1) == 1 &&
+                re::enum_value(step, "PS5_CROSSSAVE_DIALOG", -1) == -1 && re::enum_value(step, "ERROR_START_INDEX", -1) == 5,
+            "SaveLoadStep INITIALIZE 0, REQUEST_WAIT 1, no PS5 steps, errors from 5 (the dx11_non-rt build)");
     check(re::enum_value(re::find_type("app.ropeway.gamemastering.RecordManager.RecordId"), "MAX", -1) == 91,
           "RecordId.MAX = 91");
     const uint32_t reward = re::find_type("app.ropeway.gamemastering.RecordManager.RewardId");
@@ -359,20 +415,18 @@ int main(int argc, char** argv) {
     check(re::enum_value(re::find_type("app.ropeway.SurvivorDefine.Accessory"), "Invalid", 0) == -1,
           "SurvivorDefine.Accessory.Invalid = -1");
     const uint32_t screen = re::find_method(re::find_type("app.ropeway.gui.RecordBehavior"), "update", {});
-    check(screen == 196123 && re::method_vt_index(screen) == 15, "RecordBehavior.update() is method 196123, virtual[15]");
+    check(index_is(screen, 196123) && slot_is(re::method_vt_index(screen), 15), "RecordBehavior.update() is method 196123, virtual[15]");
     const uint32_t rscreen = re::find_method(re::find_type("app.ropeway.gui.RogueRecordBehavior"), "update", {});
-    check(rscreen == 159620 && re::method_vt_index(rscreen) == 15,
+    check(index_is(rscreen, 159620) && slot_is(re::method_vt_index(rscreen), 15),
           "RogueRecordBehavior.update() is method 159620, virtual[15]");
     const uint32_t am = re::find_type("app.ropeway.gamemastering.AchievementManager");
-    check(re::find_method(am, "unlockRecord", {"app.ropeway.gamemastering.RecordManager.RecordId", "System.Boolean"}) ==
-              356242,
+    check(index_is(re::find_method(am, "unlockRecord", {"app.ropeway.gamemastering.RecordManager.RecordId", "System.Boolean"}), 356242),
           "AchievementManager.unlockRecord(RecordId, Boolean) is instance method 356242");
-    check(re::find_method(am, "unlockRogueClearRecord", {"app.ropeway.gamemastering.RogueRecordManager.RogueRecordId"}) ==
-              356240,
+    check(index_is(re::find_method(am, "unlockRogueClearRecord", {"app.ropeway.gamemastering.RogueRecordManager.RogueRecordId"}), 356240),
           "AchievementManager.unlockRogueClearRecord(RogueRecordId) is instance method 356240");
-    check(re::find_method(re::find_type("app.ropeway.gamemastering.RogueAccessoryManager"),
+    check(index_is(re::find_method(re::find_type("app.ropeway.gamemastering.RogueAccessoryManager"),
                           "convertRewardIdToAccessoryDefine",
-                          {"app.ropeway.gamemastering.RogueRecordManager.RogueRewardId"}) == 247714,
+                          {"app.ropeway.gamemastering.RogueRecordManager.RogueRewardId"}), 247714),
           "RogueAccessoryManager.convertRewardIdToAccessoryDefine(RogueRewardId) is instance method 247714");
     const char* const kAchDict =
         "System.Collections.Generic.Dictionary`2<app.ropeway.gamemastering.RecordManager.RecordId,"
@@ -396,7 +450,7 @@ int main(int argc, char** argv) {
     const uint32_t base = re::find_type("app.ropeway.gui.SaveLoadBaseBehavior");
     check(load && base && re::parent(load) == base, "LoadBehavior's parent is SaveLoadBaseBehavior");
     const uint32_t upd = re::find_method(base, "update", {});
-    check(upd == 194697 && re::method_vt_index(upd) == 15, "SaveLoadBaseBehavior.update() is method 194697, virtual[15]");
+    check(index_is(upd, 194697) && slot_is(re::method_vt_index(upd), 15), "SaveLoadBaseBehavior.update() is method 194697, virtual[15]");
     check(re::find_method(load, "update", {}) == 0, "LoadBehavior has no update of its own (its vtable holds its base's)");
     check_field("app.ropeway.gui.LoadBehavior", "<SaveFileDetailList>k__BackingField", 0x20);
     check_field("app.ropeway.gui.LoadBehavior", "<SaveFileDetailTextList>k__BackingField", 0x28);
@@ -404,8 +458,8 @@ int main(int argc, char** argv) {
     check_field("app.ropeway.gui.LoadBehavior", "SaveModeValue", 0x40);
     check_field("app.ropeway.gui.LoadBehavior", "IsLoaded", 0x90);
     check_field("app.ropeway.gui.LoadBehavior", "IsSaved", 0x91);
-    check(re::find_method(base, "set_SaveFileDetailList",
-                          {"System.Collections.Generic.List`1<via.storage.saveService.SaveFileDetail>"}) == 194681,
+    check(index_is(re::find_method(base, "set_SaveFileDetailList",
+                          {"System.Collections.Generic.List`1<via.storage.saveService.SaveFileDetail>"}), 194681),
           "SaveLoadBaseBehavior.set_SaveFileDetailList(List<SaveFileDetail>) is method 194681");
     check(re::enum_value(re::find_type("app.ropeway.gamemastering.SaveDataManager.SaveMode"), "SCENARIO", -1) == 1,
           "SaveDataManager.SaveMode.SCENARIO = 1");
@@ -423,24 +477,30 @@ int main(int argc, char** argv) {
     check_field("app.ropeway.gamemastering.SaveDataManager", "<LastDetailUserIndex>k__BackingField", 0x58);
     check_field("app.ropeway.gamemastering.SaveDataManager", "<saveLoadStep>k__BackingField", 0x5C);
     const uint32_t svc = re::find_type("via.storage.saveService.SaveService");
-    check(re::find_method(svc, "updateSaveFileDetailTbl", {"via.UserIndex"}, true) == 299023,
-          "SaveService.updateSaveFileDetailTbl(UserIndex) is static method 299023");
+    // Not in the dx11_non-rt build: there savefiles.cpp does what it does as field writes.
+    if (g_rt)
+      check(index_is(re::find_method(svc, "updateSaveFileDetailTbl", {"via.UserIndex"}, true), 299023),
+            "SaveService.updateSaveFileDetailTbl(UserIndex) is static method 299023");
+    else
+      check(re::find_method(svc, "updateSaveFileDetailTbl", {"via.UserIndex"}, true) == 0,
+            "no SaveService.updateSaveFileDetailTbl in the dx11_non-rt build (the list is re-read by field writes)");
     check(re::find_method(svc, "updateSaveFileDetailTbl", {"via.UserIndex"}) == 0, "(and no instance method of the name)");
     check(re::enum_value(re::find_type("via.UserIndex"), "Reserved", -1) == 16, "via.UserIndex: User0-15, Reserved = 16");
     const uint32_t detail = re::find_type("via.storage.saveService.SaveFileDetail");
-    check(re::find_method(detail, "get_Slot", {}) == 88627 && re::find_method(detail, "get_Title", {}) == 88621 &&
-              re::find_method(detail, "get_SubTitle", {}) == 88623 && re::find_method(detail, "get_Detail", {}) == 88625 &&
-              re::find_method(detail, "get_LastUpdateTimeStamp", {}) == 88628 &&
-              re::find_method(detail, "get_UseSize", {}) == 88630,
+    check(index_is(re::find_method(detail, "get_Slot", {}), 88627) && index_is(re::find_method(detail, "get_Title", {}), 88621) &&
+              index_is(re::find_method(detail, "get_SubTitle", {}), 88623) && index_is(re::find_method(detail, "get_Detail", {}), 88625) &&
+              index_is(re::find_method(detail, "get_LastUpdateTimeStamp", {}), 88628) &&
+              (g_rt ? index_is(re::find_method(detail, "get_UseSize", {}), 88630)
+                    : re::find_method(detail, "get_UseSize", {}) == 0),  // no sizes in the dx11_non-rt build
           "SaveFileDetail's getters: Slot 88627, Title 88621, SubTitle 88623, Detail 88625, LastUpdateTimeStamp 88628, "
           "UseSize 88630");
-    check(re::find_method(detail, "get_InvalidSlot", {}) == 88633, "SaveFileDetail.get_InvalidSlot() is method 88633");
+    check(index_is(re::find_method(detail, "get_InvalidSlot", {}), 88633), "SaveFileDetail.get_InvalidSlot() is method 88633");
     check(re::find_type("System.Collections.Generic.List`1<via.storage.saveService.SaveFileDetail>") &&
               re::find_type("System.Collections.Generic.List`1<System.Collections.Generic.List`1<System.String>>") &&
               re::find_type("System.Collections.Generic.List`1<System.String>"),
           "List<SaveFileDetail>, List<List<String>> and List<String> are named");
     const uint32_t str = re::find_type("System.String");
-    check(re::find_method(str, "get_Chars", {"System.Int32"}) == 270891 && re::find_method(str, "get_Length", {}) == 270886,
+    check(index_is(re::find_method(str, "get_Chars", {"System.Int32"}), 270891) && index_is(re::find_method(str, "get_Length", {}), 270886),
           "String.get_Chars(Int32) is method 270891, get_Length() 270886");
   }
 
@@ -450,8 +510,9 @@ int main(int argc, char** argv) {
   {
     const uint32_t ec = re::find_type("app.ropeway.EnemyController");
     const uint32_t idx = re::find_method(ec, "HitController_OnHitDamage", {"app.Collision.HitController.DamageInfo"});
-    check(idx == 113641, "EnemyController.HitController_OnHitDamage(DamageInfo) is method 113641");
+    check(index_is(idx, 113641), "EnemyController.HitController_OnHitDamage(DamageInfo) is method 113641");
     const uintptr_t rec = re::method_record_at(idx);
+    const uintptr_t code_at = g_rt ? 8 : 0x18;  // where a method record keeps its code
     check(rec && re::method_at(rec) == "app.ropeway.EnemyController.HitController_OnHitDamage", "its entry names it");
     struct Fn {
       static void original() {}
@@ -460,24 +521,24 @@ int main(int argc, char** argv) {
     const auto orig = reinterpret_cast<uintptr_t>(&Fn::original);
     const auto repl = reinterpret_cast<uintptr_t>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     check(re::hook_method(rec, repl) == 0, "an entry with no code is not hooked");
-    *reinterpret_cast<uintptr_t*>(rec + 8) = orig;
-    check(re::hook_method(rec, repl) == orig && *reinterpret_cast<uintptr_t*>(rec + 8) == repl,
+    *reinterpret_cast<uintptr_t*>(rec + code_at) = orig;
+    check(re::hook_method(rec, repl) == orig && *reinterpret_cast<uintptr_t*>(rec + code_at) == repl,
           "hook_method exchanges the code and returns the original");
     check(re::hook_method(rec, repl) == 0, "an entry holding a non-game pointer (the replacement) is not hooked again");
     check(!re::unhook_method(rec, orig, repl), "unhook refuses when the entry does not hold that replacement");
-    check(re::unhook_method(rec, repl, orig) && *reinterpret_cast<uintptr_t*>(rec + 8) == orig, "unhook puts it back");
-    check(re::hook_method(rec + 8, repl) == 0 && re::hook_method(0, repl) == 0, "only method entries are hooked");
+    check(re::unhook_method(rec, repl, orig) && *reinterpret_cast<uintptr_t*>(rec + code_at) == orig, "unhook puts it back");
+    check(re::hook_method(rec + code_at, repl) == 0 && re::hook_method(0, repl) == 0, "only method entries are hooked");
     // In the game the entries are in re2.exe's .data, copy-on-write pages - or
     // pages the runtime may protect: the exchange must get through either.
     DWORD old = 0;
-    VirtualProtect(reinterpret_cast<void*>(rec + 8), 8, PAGE_READONLY, &old);
+    VirtualProtect(reinterpret_cast<void*>(rec + code_at), 8, PAGE_READONLY, &old);
     unsigned long protect = 0;
-    check(re::hook_method(rec, repl, &protect) == orig && *reinterpret_cast<uintptr_t*>(rec + 8) == repl &&
+    check(re::hook_method(rec, repl, &protect) == orig && *reinterpret_cast<uintptr_t*>(rec + code_at) == repl &&
               protect == PAGE_READONLY,
           "hook_method gets through a read-only page (and says so)");
-    check(re::unhook_method(rec, repl, orig) && *reinterpret_cast<uintptr_t*>(rec + 8) == orig, "unhook too");
-    VirtualProtect(reinterpret_cast<void*>(rec + 8), 8, old, &old);
-    *reinterpret_cast<uintptr_t*>(rec + 8) = 0;
+    check(re::unhook_method(rec, repl, orig) && *reinterpret_cast<uintptr_t*>(rec + code_at) == orig, "unhook too");
+    VirtualProtect(reinterpret_cast<void*>(rec + code_at), 8, old, &old);
+    *reinterpret_cast<uintptr_t*>(rec + code_at) = 0;
   }
 
   std::printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "PASSED", g_fail);

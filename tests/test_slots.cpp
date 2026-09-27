@@ -146,6 +146,70 @@ int main() {
     const bool want[] = {false, false, false, false, false, false, false, false};
     expect_dead("a slot the player does not have yet is not dead", rule, slot, 8, 6, want);
   }
+
+  // game::pick_combo - the game's rule for a weapon's magazine and ammo kind
+  // (WeaponLoadingpartsCombination.getNumber / getKind: two passes each), on
+  // the entries the game's own WeaponBulletUserData holds (build 11636119, read
+  // out of the archive 2026-09-25).
+  {
+    using re2cc::game::ComboEntry;
+    using re2cc::game::ComboPick;
+    using re2cc::game::pick_combo;
+    // The Matilda (WP1000): a base entry of 12 Handgun rounds that overwrites
+    // both figures, and the high-capacity magazine's (parts 0x4) entry of 12
+    // more that overwrites neither.
+    const ComboEntry matilda[] = {{9999, 0, true, false, 12, true, 1}, {1000, 4, false, false, 12, false, 0}};
+    ComboPick p = pick_combo(matilda, 2, 0);
+    check(p.count == 12 && p.kind == 1, "the Matilda with no parts: 12 rounds of Handgun ammo (kind 1)");
+    p = pick_combo(matilda, 2, 7);
+    check(p.count == 24 && p.kind == 1, "the Matilda with every part: the magazine adds 12, the kind stays Handgun");
+    p = pick_combo(matilda, 2, 3);
+    check(p.count == 12 && p.kind == 1, "the Matilda with parts A and B only: the magazine's entry (parts 0x4) does not apply");
+    // The same two entries in the other order: the priorities decide, not the list.
+    const ComboEntry reversed[] = {matilda[1], matilda[0]};
+    p = pick_combo(reversed, 2, 7);
+    check(p.count == 24 && p.kind == 1, "the entries' order in the list does not matter");
+    // The Lightning Hawk (WP4000 = 9): a base entry of 5 Magnum rounds, and a part
+    // whose entry adds a second kind (Magnum2, 0x400) without overwriting.
+    const ComboEntry hawk[] = {{9999, 0, true, false, 5, true, 8}, {1000, 2, false, false, 0, false, 0x400}};
+    p = pick_combo(hawk, 2, 0);
+    check(p.count == 5 && p.kind == 8, "the Lightning Hawk with no parts: 5 rounds, Magnum");
+    p = pick_combo(hawk, 2, 2);
+    check(p.count == 5 && p.kind == 0x408, "with its part: the second kind is ORed in (0x408), the count unchanged");
+    // WP8300-8500: one entry of priority 0 that overwrites the number but not the
+    // kind - the kind comes through the second pass alone (the first pass leaves
+    // its best priority at INT32_MAX, so every non-overwriting entry counts).
+    const ComboEntry ghost[] = {{0, 0, true, false, 15, false, 1}};
+    p = pick_combo(ghost, 1, 0);
+    check(p.count == 15 && p.kind == 1, "an entry that does not overwrite the kind still names it (WP8300)");
+    // The infinite weapons: _Infinity makes the count -1.
+    const ComboEntry infinite[] = {{9999, 0, true, true, 1000, true, 0}};
+    p = pick_combo(infinite, 1, 0);
+    check(p.count == -1 && p.kind == 0, "an infinite weapon is full at -1 and names no ammo");
+    // A knife, a grenade: a count and no kind.
+    const ComboEntry knife[] = {{9999, 0, true, false, 1000, true, 0}};
+    p = pick_combo(knife, 1, 7);
+    check(p.count == 1000 && p.kind == 0, "a knife: its durability, no ammo");
+    // The GM 79 (WP6000 = 42): one entry naming both grenade kinds at once (0x30).
+    const ComboEntry gm79[] = {{9999, 0, true, false, 1, true, 0x30}};
+    p = pick_combo(gm79, 1, 0);
+    check(p.count == 1 && p.kind == 0x30, "the GM 79 takes two kinds of rounds: both flags, one round");
+    // No entry at all, and no entry for the parts fitted.
+    p = pick_combo(nullptr, 0, 0);
+    check(p.count == 0 && p.kind == 0, "no entries: nothing");
+    const ComboEntry only_parts[] = {{9999, 1, true, false, 8, true, 1}};
+    p = pick_combo(only_parts, 1, 0);
+    check(p.count == 0 && p.kind == 0, "an entry for a part not fitted does not apply");
+    // Two overwriting entries: the lower priority wins; a non-overwriting one
+    // above it (a higher priority number) is not added.
+    const ComboEntry layered[] = {{9999, 0, true, false, 12, true, 1}, {500, 1, true, false, 30, true, 2}, {2000, 1, false, false, 5, false, 4}};
+    p = pick_combo(layered, 3, 1);
+    check(p.count == 30 && p.kind == 2, "the lowest-priority overwriting entry sets the figure; entries above it add nothing");
+    const ComboEntry layered2[] = {{9999, 0, true, false, 12, true, 1}, {500, 1, true, false, 30, true, 2}, {100, 1, false, false, 5, false, 4}};
+    p = pick_combo(layered2, 3, 1);
+    check(p.count == 35 && p.kind == 6, "a non-overwriting entry below the winner adds to it");
+  }
+
   std::printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "PASSED", g_fail);
   return g_fail ? 1 : 0;
 }

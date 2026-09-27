@@ -4,6 +4,7 @@
 #include <dinput.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 
 #include "config.h"
@@ -214,6 +215,17 @@ bool start(HWND window) {
     logf("keyboard: disabled by config - the panel takes keys from the window's messages");
     return false;
   }
+  // The device is Wine's answer: there an exclusive game keyboard leaves the
+  // window no key messages. Windows sends them anyway (seen 2026-09-25), and
+  // there the Steam overlay hooks DirectInput's devices the way it hooks swap
+  // chains (overlay_d3d.cpp): a device of the mod's, and the guard below in a
+  // vtable it re-reads, would only give it the mod's functions to hook.
+  const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll || !GetProcAddress(ntdll, "wine_get_version")) {
+    logf("keyboard: Windows - the panel takes keys from the window's messages (what is typed into it reaches the "
+         "game too)");
+    return false;
+  }
   // The game has dinput8 loaded (it imports it); DirectInput8Create is taken
   // from it at run time, so the mod imports no dinput8 of its own.
   HMODULE dll = GetModuleHandleW(L"dinput8.dll");
@@ -265,9 +277,40 @@ bool start(HWND window) {
   g_active = true;
   // The game's keyboard is kept from what is typed into the panel: the two
   // reads, in the vtable the panel's device shares with the game's.
+  // Only while both still hold dinput8's own functions: a hook of another
+  // program's there would become what the mod calls on to, and a program that
+  // hooks whatever the slot holds (the Steam overlay, on Windows - not reached
+  // here) would then take the mod's hook for its original, a circle. Hooked
+  // first, the mod calls dinput8 itself, and any later hook ends there.
   bool guarded = false;
-  if (!config::get().disable_input) {
-    auto** vt = *reinterpret_cast<void***>(dev);
+  const char* unguarded = nullptr;
+  auto** vt = *reinterpret_cast<void***>(dev);
+  auto in_dinput8 = [dll](void* fn) {
+    HMODULE owner = nullptr;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(fn), &owner) &&
+           owner == dll;
+  };
+  char foreign[MAX_PATH + 32] = "";
+  if (config::get().disable_input) {
+    unguarded = "not guarded (the input guard is disabled by config)";
+  } else if (!in_dinput8(vt[kGetDeviceState]) || !in_dinput8(vt[kGetDeviceData])) {
+    // Whose it is, for the log.
+    void* fn = in_dinput8(vt[kGetDeviceState]) ? vt[kGetDeviceData] : vt[kGetDeviceState];
+    HMODULE owner = nullptr;
+    char path[MAX_PATH] = "";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(fn), &owner) &&
+        GetModuleFileNameA(owner, path, MAX_PATH)) {
+      const char* leaf = std::strrchr(path, '\\');
+      std::snprintf(foreign, sizeof(foreign), "%s+0x%llX", leaf ? leaf + 1 : path,
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fn) - reinterpret_cast<uintptr_t>(owner)));
+    } else {
+      std::snprintf(foreign, sizeof(foreign), "%p", fn);
+    }
+    unguarded = "NOT guarded - another program already hooks its reads, and a second hook there would call it in a "
+                "circle; what is typed into the panel reaches the game too";
+  } else {
     g_real_state = reinterpret_cast<GetStateFn>(vt[kGetDeviceState]);
     g_real_data = reinterpret_cast<GetDataFn>(vt[kGetDeviceData]);
     const uintptr_t state_slot = reinterpret_cast<uintptr_t>(&vt[kGetDeviceState]);
@@ -277,13 +320,14 @@ bool start(HWND window) {
     if (mem::exchange_ptr(data_slot, reinterpret_cast<uintptr_t>(g_real_data), reinterpret_cast<uintptr_t>(&hk_get_data)))
       g_data_slot = data_slot;
     guarded = g_state_slot && g_data_slot;
+    if (!guarded) unguarded = "NOT guarded - its vtable could not be hooked";
   }
   logf("keyboard: the panel reads the keyboard through its own DirectInput device (non-exclusive); the game's "
-       "DirectInput keyboard is %s",
-       guarded                        ? "kept from what is typed into the panel (GetDeviceState/GetDeviceData hooked in "
-                                        "dinput8's device vtable)"
-       : config::get().disable_input ? "not guarded (the input guard is disabled by config)"
-                                      : "NOT guarded - its vtable could not be hooked");
+       "DirectInput keyboard is %s%s%s",
+       guarded ? "kept from what is typed into the panel (GetDeviceState/GetDeviceData hooked in dinput8's device "
+                 "vtable)"
+               : unguarded,
+       foreign[0] ? " - its slot holds " : "", foreign);
   return true;
 }
 

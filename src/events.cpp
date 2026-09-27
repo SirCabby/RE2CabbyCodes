@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <initializer_list>
+#include <vector>
 
 #include "call.h"
 #include "config.h"
@@ -47,9 +49,38 @@ enum Hook : int {
   kRecordsScreen,       // the records panel: RecordBehavior.update
   kRogueRecordsScreen,  // RogueRecordBehavior.update
   kLoadScreen,          // the save files: LoadBehavior.update (SaveLoadBaseBehavior's, in LoadBehavior's vtable)
+  // The dx11_non-rt build's own (install): where its `lea`-made delegates cannot be reached,
+  // the same events heard at virtual methods.
+  kThinkDamage,      // One hit kills: EnemyThinkBehavior.onHitDamage, in every enemy Think class's vtable
+  kTypewriterFuncs,  // Save without ink ribbons: GimmickTypeWriter.getTriggerFuncCheckValid (and its interface slot)
+  kUseCheck,         // Infinite wooden boards: TriggerUseItem.checkValid, in every use-item trigger class's vtable
   kHookCount
 };
 constexpr int kFirstSlotHook = kFire;
+
+// A virtual method hooked in a whole family of classes: every class deriving from
+// the hook's class whose vtable has the slot, each with the code that slot held -
+// an override of its own or one inherited - kept against its vtable, so the one
+// replacement finds what to forward to from the object it is handed.
+constexpr int kFamily = 64;
+struct Family {
+  std::vector<uint32_t> classes;           // the family, found once (install)
+  std::atomic<uintptr_t> vtable[kFamily];  // written before the slot is exchanged
+  std::atomic<uintptr_t> original[kFamily];
+  uintptr_t slot[kFamily] = {};
+  std::atomic<int> count{0};
+};
+Family g_think_family, g_use_family;
+
+// The code a family's vtable held for `obj` (0: not one of the family's).
+uintptr_t family_original(const Family& f, uintptr_t obj) {
+  const uintptr_t info = mem::read_ptr(obj);
+  const uintptr_t table = info ? mem::read_ptr(info - 0x10) : 0;
+  const int n = f.count.load(std::memory_order_acquire);
+  for (int i = 0; table && i < n; ++i)
+    if (f.vtable[i].load(std::memory_order_relaxed) == table) return f.original[i].load(std::memory_order_relaxed);
+  return 0;
+}
 
 struct State {
   const char* name = "";
@@ -62,6 +93,9 @@ struct State {
   uintptr_t slot[8] = {};       // the vtable / interface slots exchanged
   int slots = 0;
   bool failed = false;          // not hookable this session (logged)
+  bool via_delegate = false;    // reached through the delegates another hook retargets (the dx11_non-rt typewriter)
+  bool captured = false;        // a vtable slot the game copies into a delegate as it makes it: in before that (pending)
+  Family* family = nullptr;     // hooked in every class of a family (the dx11_non-rt build's)
   bool first_logged = false;
   DWORD waiting_since = 0;      // a vtable hook still waiting for its class (the log)
 };
@@ -74,7 +108,12 @@ inline Fn original(Hook h) {
   return reinterpret_cast<Fn>(g_hook[h].original.load(std::memory_order_relaxed));
 }
 inline bool on(cheats::Kind k) { return cheats::enabled(k); }
-bool hooked(Hook h) { return g_hook[h].original.load() && (g_hook[h].record || g_hook[h].slots > 0); }
+bool hooked(Hook h) {
+  const State& st = g_hook[h];
+  if (st.family) return st.family->count.load() > 0;
+  if (st.via_delegate) return st.original.load() && hooked(kTypewriterFuncs);
+  return st.original.load() && (st.record || st.slots > 0);
+}
 
 bool is_sub_weapon(int weapon_id) {
   for (const auto& w : items::kWeapons)
@@ -151,6 +190,32 @@ void on_reaction_damage(uintptr_t ctx, uintptr_t reaction, uintptr_t info) {
   original<InfoFn>(kReactionDamage)(ctx, reaction, info);
 }
 
+// The dx11_non-rt build: its hit handlers above are `lea`-made delegates, which no
+// exchanged pointer reaches. There the hit is heard at the enemy's Think instead -
+// EnemyThinkBehavior.onHitDamage (virtual[43] in that build), which the hit handler
+// calls through the Think's vtable after the game's own addDamage and before its
+// "was alive and is not: dead()" - so the kill is made there: the HP to 0, the
+// plant's flame-only health emptied, G2's stagger counter topped up (its own
+// onHitDamage, the Think's, adds this hit's share to it), each just before the
+// Think's own onHitDamage runs. Every enemy Think class's vtable holds this in the
+// slot - its own override or an inherited one - and the object's vtable says which
+// to forward to.
+void on_think_damage(uintptr_t ctx, uintptr_t think, uintptr_t info) {
+  count(kThinkDamage);
+  if (on(cheats::kOneHitKills)) {
+    if (const uintptr_t enemy = game::think_controller(think)) {
+      const uintptr_t hpc = game::enemy_hit_points(enemy);
+      const int plant = game::wither_plant_after(enemy, hpc, info);
+      trace_plant(enemy, plant);
+      if (plant == game::kNotAPlant) {
+        trace_lethal("its Think", enemy, game::make_lethal_after(hpc, enemy, info));
+        trace_stun(enemy, game::stun_g2(enemy));
+      }
+    }
+  }
+  if (const uintptr_t code = family_original(g_think_family, think)) reinterpret_cast<InfoFn>(code)(ctx, think, info);
+}
+
 // --- God mode ---------------------------------------------------------------------------------------------
 // A hit on a survivor, before the game decides whether it kills: the player is
 // brought back to full first, so only a hit worth more than all of it can.
@@ -208,6 +273,64 @@ bool on_typewriter_check(uintptr_t ctx, uintptr_t typewriter, uintptr_t trigger)
 bool on_typewriter_ribbon(uintptr_t ctx, uintptr_t typewriter, uintptr_t trigger) {
   count(kTypewriterRibbon);
   return original<CheckFn>(swap_typewriter_checks() ? kTypewriterCheck : kTypewriterRibbon)(ctx, typewriter, trigger);
+}
+
+// The dx11_non-rt build makes the two checks' delegates as `lea r9,[lambda]` in
+// GimmickTypeWriter.getTriggerFuncCheckValid - which is virtual (and the trigger's
+// setup calls it through ITriggerFuncProvider). Its result is the delegate made
+// just now for this trigger: one entry, the typewriter and the lambda's code where
+// that build's new-delegate helper put them (g_delegate, read out of the helper).
+// The code is pointed at the two hooks above, which forward to the lambdas: the
+// same checks, run where the current build's exchanged entries would run them.
+struct DelegateLayout {
+  int32_t count_off = -1, target_off = -1, code_off = -1;
+  bool ok() const { return count_off >= 0 && target_off >= 0 && code_off >= 0; }
+} g_delegate;
+
+using FuncsFn = uintptr_t (*)(uintptr_t ctx, uintptr_t self, uintptr_t trigger);
+uintptr_t on_typewriter_funcs(uintptr_t ctx, uintptr_t typewriter, uintptr_t trigger) {
+  count(kTypewriterFuncs);
+  const uintptr_t d = original<FuncsFn>(kTypewriterFuncs)(ctx, typewriter, trigger);
+  if (!d || call::exception_pending(ctx) || !g_delegate.ok()) return d;
+  int32_t n = 0;
+  uintptr_t target = 0, code = 0;
+  if (!mem::read_safe(d + static_cast<uintptr_t>(g_delegate.count_off), &n) || n != 1 ||
+      !mem::read_safe(d + static_cast<uintptr_t>(g_delegate.target_off), &target) || target != typewriter ||
+      !mem::read_safe(d + static_cast<uintptr_t>(g_delegate.code_off), &code))
+    return d;
+  for (const Hook h : {kTypewriterCheck, kTypewriterRibbon})
+    if (code && code == g_hook[h].original.load()) {
+      mem::store<uintptr_t>(d + static_cast<uintptr_t>(g_delegate.code_off), g_hook[h].replacement);
+      break;
+    }
+  return d;
+}
+
+// Where that build's new-delegate helper puts a delegate's one entry: the call after
+// `lea r9,[the 'Check' lambda]` in getTriggerFuncCheckValid, whose body takes the
+// target and the code as `mov rbp,r8; mov rsi,r9` and stores `mov dword [rcx+N],1;
+// mov [rcx+C],rsi; mov [rcx+T],rbp` (build 11055033: 0x10, 0x20, 0x18).
+void find_delegate_layout(uintptr_t funcs, uintptr_t lambda) {
+  const mem::Range text = mem::section(GetModuleHandleA(nullptr), ".text");
+  for (uintptr_t p = funcs; funcs && lambda && p < funcs + 0x200 && !g_delegate.ok(); ++p) {
+    if (!mem::matches(p, "4C 8D 0D") || mem::rip_target(p, 3, 7) != lambda) continue;
+    for (uintptr_t q = p + 7; q < p + 7 + 0x40; ++q) {
+      if (mem::read<uint8_t>(q) != 0xE8) continue;
+      const uintptr_t helper = mem::rip_target(q, 1, 5);
+      if (!text.contains(helper)) break;
+      bool rsi = false, rbp = false;
+      DelegateLayout l;
+      for (uintptr_t r = helper; r < helper + 0x140; ++r) {
+        rsi = rsi || mem::matches(r, "49 8B F1");
+        rbp = rbp || mem::matches(r, "49 8B E8");
+        if (mem::matches(r, "C7 41 ?? 01 00 00 00")) l.count_off = mem::read<uint8_t>(r + 2);
+        if (mem::matches(r, "48 89 71 ??")) l.code_off = mem::read<uint8_t>(r + 3);
+        if (mem::matches(r, "48 89 69 ??")) l.target_off = mem::read<uint8_t>(r + 3);
+      }
+      if (rsi && rbp && l.ok()) g_delegate = l;
+      break;
+    }
+  }
 }
 
 // --- No durability loss ----------------------------------------------------------------------------------
@@ -274,6 +397,20 @@ void keep_boards(Hook h, uintptr_t ctx, uintptr_t closure) {
 
 void on_use_item(uintptr_t ctx, uintptr_t closure) { keep_boards(kUseItem, ctx, closure); }
 void on_use_useless(uintptr_t ctx, uintptr_t closure) { keep_boards(kUseUseless, ctx, closure); }
+
+// The dx11_non-rt build makes the callbacks above as `lea`-made delegates. There the
+// trigger's own check is heard instead - TriggerUseItem.checkValid (virtual[7]), run
+// before any use (the prompt, the button) - and its boards item data (Items,
+// UselessItems) marked there: the same marks, a little earlier.
+using CheckValidFn = bool (*)(uintptr_t ctx, uintptr_t self, bool for_icon);
+bool on_use_check(uintptr_t ctx, uintptr_t trigger, bool for_icon) {
+  count(kUseCheck);
+  const int done = game::mark_trigger_boards(trigger, on(cheats::kInfiniteBoards));
+  if (done != 0 && config::get().trace)
+    logf("infinite wooden boards: %s", done > 0 ? "this window takes no board" : "a window takes its boards again");
+  const uintptr_t code = family_original(g_use_family, trigger);
+  return code ? reinterpret_cast<CheckValidFn>(code)(ctx, trigger, for_icon) : false;
+}
 
 // --- Infinite ammo ----------------------------------------------------------------------------------------
 // A shot (Equipment.executeFire -> use -> useMainWeapon -> Inventory.reduceSlot):
@@ -536,6 +673,50 @@ void hook_slots(Hook h, bool interfaces) {
        re::classes_sharing_vtable(st.cls));
 }
 
+// A family hook (the dx11_non-rt build's One hit kills and boards): every class of
+// the family whose vtable is up and holds the game's code in the slot - recorded
+// with that code, then exchanged. Classes still to come up are tried again each
+// second; a vtable two classes share is hooked once.
+void hook_family(Hook h) {
+  State& st = g_hook[h];
+  Family* f = st.family;
+  if (st.failed || !f || !st.method) return;
+  const int vt = re::method_vt_index(st.method);
+  if (vt < 0) return fail(st, "its method is not virtual");
+  const mem::Range text = mem::section(GetModuleHandleA(nullptr), ".text");
+  int added = 0, up = 0;
+  for (const uint32_t t : f->classes) {
+    const uintptr_t table = re::vtable_of(t);
+    if (!table) continue;  // not up yet
+    ++up;
+    const uintptr_t slot = table + static_cast<uintptr_t>(vt) * 8;
+    const uintptr_t code = mem::read_ptr(slot);
+    if (code == st.replacement || !text.contains(code)) continue;  // hooked (a shared vtable), or not the game's code
+    const int n = f->count.load(std::memory_order_relaxed);
+    bool known = false;
+    for (int i = 0; i < n; ++i) known = known || f->vtable[i].load(std::memory_order_relaxed) == table;
+    if (known) continue;
+    if (n >= kFamily) {
+      logf("events: %s - more than %d vtables: %s is not hooked", st.name, kFamily, re::full_name(t).c_str());
+      break;
+    }
+    // Recorded before the exchange: the game may call the slot the moment it holds the hook.
+    f->vtable[n].store(table, std::memory_order_relaxed);
+    f->original[n].store(code, std::memory_order_relaxed);
+    f->slot[n] = slot;
+    f->count.store(n + 1, std::memory_order_release);
+    if (re::swap_slot(slot, code, st.replacement)) ++added;
+  }
+  if (added) {
+    if (!st.original.load()) st.original = f->original[0].load();
+    logf("events: %s hooked in %d more vtable(s) (%d in all, slot %d; %d of the %u classes up)", st.name, added,
+         f->count.load(), vt, up, static_cast<unsigned>(f->classes.size()));
+  } else if (!up && !st.waiting_since) {
+    st.waiting_since = GetTickCount();
+    logf("events: %s - waiting for its %u classes to come up", st.name, static_cast<unsigned>(f->classes.size()));
+  }
+}
+
 }  // namespace
 
 void install() {
@@ -594,17 +775,76 @@ void install() {
          reinterpret_cast<uintptr_t>(&on_rogue_records_screen), records::screen_class(records::kRogue));
   define(kLoadScreen, "LoadBehavior.update (the save files)", savefiles::screen_update(),
          reinterpret_cast<uintptr_t>(&on_load_screen), savefiles::screen_class());
+  // God mode's two, in the dx11_non-rt build (TDB 66): there the player's condition
+  // makes its hit handlers in doStart from its class's vtable - `mov rcx,[info-0x10];
+  // mov r9,[rcx+slot*8]` before the new-delegate helper - where the current build
+  // makes them from the methods' database entries (a global points at each). So there
+  // they are vtable hooks, in PlayerCondition's own table, in before a game starts.
+  // (That build makes its other delegates from the code itself - `lea r9,[code]` -
+  // which no exchanged pointer reaches: see why_not.)
+  if (re::tdb_version() == 66) {
+    const uint32_t player = re::find_type("app.ropeway.survivor.player.PlayerCondition");
+    g_hook[kPlayerCheck].cls = player;
+    g_hook[kPlayerDamage].cls = player;
+    g_hook[kPlayerCheck].captured = g_hook[kPlayerDamage].captured = true;
+    // The handlers that build makes as `lea r9,[code]` delegates (tools/tdb_dump.py
+    // --link and a scan of the code for each method's address: no global, no vtable,
+    // only the lea): an exchanged database entry is never read. Their events are heard
+    // at virtual methods there instead - approved by the user 2026-09-24.
+    for (const Hook h : {kEnemyDamage, kReactionDamage, kPlayerHp, kUseItem, kUseUseless})
+      if (g_hook[h].method)
+        fail(g_hook[h], "the dx11_non-rt build makes this delegate with `lea` - its event is heard at a virtual "
+                        "method there");
+    auto family_of = [](Hook h, Family* f) {
+      g_hook[h].family = f;
+      f->classes.clear();
+      for (uint32_t t = 1; g_hook[h].cls && t < re::num_types(); ++t)
+        if (re::derives(t, g_hook[h].cls)) f->classes.push_back(t);
+    };
+    // One hit kills: the enemy's Think, in every Think class.
+    define(kThinkDamage, "EnemyThinkBehavior.onHitDamage (One hit kills, the dx11_non-rt build)", ev.think_damage,
+           reinterpret_cast<uintptr_t>(&on_think_damage), ev.think);
+    family_of(kThinkDamage, &g_think_family);
+    // Save without ink ribbons: the two checks, reached through the delegates
+    // getTriggerFuncCheckValid returns (their code pointed at the check hooks).
+    for (const Hook h : {kTypewriterCheck, kTypewriterRibbon})
+      if (g_hook[h].method) {
+        g_hook[h].original = re::method_code_at(g_hook[h].method);
+        g_hook[h].via_delegate = true;
+      }
+    define(kTypewriterFuncs, "GimmickTypeWriter.getTriggerFuncCheckValid (Save without ink ribbons, the dx11_non-rt build)",
+           g_hook[kTypewriterCheck].original.load() && g_hook[kTypewriterRibbon].original.load() ? ev.typewriter_funcs : 0,
+           reinterpret_cast<uintptr_t>(&on_typewriter_funcs), ev.typewriter);
+    if (g_hook[kTypewriterFuncs].method) {
+      find_delegate_layout(re::method_code_at(ev.typewriter_funcs), g_hook[kTypewriterCheck].original.load());
+      if (g_delegate.ok())
+        logf("events: a delegate of the dx11_non-rt build: its count +0x%X, target +0x%X, code +0x%X", g_delegate.count_off,
+             g_delegate.target_off, g_delegate.code_off);
+      else
+        fail(g_hook[kTypewriterFuncs], "the new-delegate helper it calls was not understood");
+    }
+    // Infinite wooden boards: the use-item trigger's own check, in every such class.
+    define(kUseCheck, "TriggerUseItem.checkValid (Infinite wooden boards, the dx11_non-rt build)",
+           game::parts().boards ? ev.use_check : 0, reinterpret_cast<uintptr_t>(&on_use_check), ev.use_trigger);
+    family_of(kUseCheck, &g_use_family);
+  }
   if (config::get().disable_events) {
     g_disabled = true;
     logf("events: disabled by config - the cheats do nothing this session");
     return;
   }
-  for (int h = 0; h < kFirstSlotHook; ++h) hook_entry(static_cast<Hook>(h));
+  for (int h = 0; h < kFirstSlotHook; ++h)
+    if (!g_hook[h].cls && !g_hook[h].failed && !g_hook[h].via_delegate) hook_entry(static_cast<Hook>(h));
   service();
 }
 
 void service() {
   if (g_disabled) return;
+  if (g_hook[kPlayerCheck].cls) hook_slots(kPlayerCheck, false);
+  if (g_hook[kPlayerDamage].cls) hook_slots(kPlayerDamage, false);
+  if (g_hook[kThinkDamage].family) hook_family(kThinkDamage);
+  if (g_hook[kUseCheck].family) hook_family(kUseCheck);
+  if (g_hook[kTypewriterFuncs].cls && g_hook[kTypewriterFuncs].method) hook_slots(kTypewriterFuncs, true);
   hook_slots(kFire, false);
   hook_slots(kMelee, false);
   hook_slots(kSaveData, true);
@@ -641,12 +881,19 @@ void service() {
   }
 }
 
+bool pending() {
+  if (g_disabled) return false;
+  for (const State& st : g_hook)
+    if (st.captured && st.method && st.cls && !st.failed && st.slots == 0) return true;
+  return false;
+}
+
 bool ready(cheats::Kind k) {
   if (g_disabled) return false;
   const game::Parts& p = game::parts();
   switch (k) {
-    case cheats::kOneHitKills: return p.enemies && p.damage && hooked(kEnemyDamage);
-    case cheats::kGodMode: return p.players && hooked(kPlayerHp);
+    case cheats::kOneHitKills: return p.enemies && p.damage && (hooked(kEnemyDamage) || hooked(kThinkDamage));
+    case cheats::kGodMode: return p.players && hooked(kPlayerCheck) && hooked(kPlayerDamage);
     case cheats::kInfiniteAmmo: return p.equipped && hooked(kFire);
     case cheats::kNoDurabilityLoss: return p.equipped && p.durability && (hooked(kMelee) || hooked(kWeaponHit));
     case cheats::kSaveWithoutInk: return p.typewriter && hooked(kTypewriterCheck) && hooked(kTypewriterRibbon);
@@ -654,7 +901,7 @@ bool ready(cheats::Kind k) {
     case cheats::kFreezePlaytime: return p.clock && hooked(kClockSave);
     // Switchable while its class is still to come up: the hook takes it from there.
     case cheats::kFreezeCountdown: return p.countdown && (hooked(kCountdownUpdate) || !g_hook[kCountdownUpdate].failed);
-    case cheats::kInfiniteBoards: return p.boards && hooked(kUseItem);
+    case cheats::kInfiniteBoards: return p.boards && (hooked(kUseItem) || hooked(kUseCheck));
     // The records' counters: the switch clears or takes the count at once (cheats.cpp), and a
     // class still to come up (an area with an item box, the player) is hooked as it does.
     case cheats::kNoItemBoxCount: return p.item_box_count && (hooked(kItemBoxOpen) || !g_hook[kItemBoxOpen].failed);
@@ -673,17 +920,19 @@ bool load_screen_hooked() { return !g_disabled && hooked(kLoadScreen); }
 
 const char* why_not(cheats::Kind k) {
   if (g_disabled) return "events disabled in the ini";
+  const bool dx11 = re::tdb_version() == 66;  // the dx11_non-rt build's hook points (install)
   auto state = [](Hook h) { return g_hook[h].failed ? "not hookable (see the log)" : "waiting for the game"; };
   switch (k) {
-    case cheats::kOneHitKills: return state(kEnemyDamage);
-    case cheats::kGodMode: return state(kPlayerHp);
+    case cheats::kOneHitKills: return state(dx11 ? kThinkDamage : kEnemyDamage);
+    case cheats::kGodMode: return state(kPlayerCheck);
     case cheats::kInfiniteAmmo: return state(kFire);
     case cheats::kNoDurabilityLoss: return !game::parts().durability ? "knives not found" : state(kMelee);
-    case cheats::kSaveWithoutInk: return !game::parts().typewriter ? "typewriters not understood" : state(kTypewriterCheck);
+    case cheats::kSaveWithoutInk:
+      return !game::parts().typewriter ? "typewriters not understood" : state(dx11 ? kTypewriterFuncs : kTypewriterCheck);
     case cheats::kNoSaveCount: return state(kSaveData);
     case cheats::kFreezePlaytime: return state(kClockSave);
     case cheats::kFreezeCountdown: return !game::parts().countdown ? "countdown not found" : state(kCountdownUpdate);
-    case cheats::kInfiniteBoards: return !game::parts().boards ? "use-item triggers not found" : state(kUseItem);
+    case cheats::kInfiniteBoards: return !game::parts().boards ? "use-item triggers not found" : state(dx11 ? kUseCheck : kUseItem);
     case cheats::kNoItemBoxCount: return !game::parts().item_box_count ? "item box count not found" : state(kItemBoxOpen);
     case cheats::kNoHealCount: return !game::parts().heal_count ? "recovery item count not found" : state(kInventoryUpdate);
     case cheats::kFreezeSteps: return !game::parts().steps ? "step count not found" : state(kFootstep);
@@ -699,6 +948,8 @@ void uninstall() {
     if (st.record && re::unhook_method(st.record, st.replacement, orig)) st.record = 0;
     for (int i = 0; i < st.slots; ++i) re::swap_slot(st.slot[i], st.replacement, orig);
     st.slots = 0;
+    if (Family* f = st.family)
+      for (int i = 0, n = f->count.load(); i < n; ++i) re::swap_slot(f->slot[i], st.replacement, f->original[i].load());
   }
 }
 

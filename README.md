@@ -63,8 +63,9 @@ pad) and a small panel appears beside the pause menu:
   functions, so it is armed and put away properly: that needs those functions and one empty entry in the
   item box for the game to be handed the weapon in, and the list says so when either is missing. The
   infinite weapons are the game's rewards - unless the record that gives one is earned (the records panel),
-  the game takes it back out of your inventory at the next load. Items that take two slots still come in
-  through the item box below.
+  the game takes it back out of your inventory at the next load. A gun made by version 1.0.3 or earlier
+  recorded no ammo type and could never be reloaded; the panel puts that right the next time the pause menu
+  opens, and says so. Items that take two slots still come in through the item box below.
 - **Item box** - the game's own item box, reachable from the pause menu, with no limits on what moves:
   **Take** puts a box item into the first free inventory slot (a two-slot item into the first two free
   slots side by side - weapons included that grow to two slots with a part fitted, like the Matilda
@@ -143,6 +144,12 @@ can sit beside REFramework.
 
 ## Install
 
+The mod works with both Steam versions of the game: the current one (the default branch, build
+11636119, with ray tracing) and the older one without ray tracing (the `dx11_non-rt` beta in the game's
+*Properties*, *Betas*, build 11055033). Switching between them in Steam replaces the game's
+`steam_api64.dll` - the mod's included - so after a switch delete `steam_api64_orig.dll` (the other
+version's) and do steps 2 and 3 again.
+
 1. Open the game's folder (in Steam: right-click the game, *Manage*, *Browse local files*) - the one
    containing `re2.exe`.
 2. Rename the existing `steam_api64.dll` to `steam_api64_orig.dll`.
@@ -151,8 +158,35 @@ can sit beside REFramework.
 Steam's *Verify integrity of game files* puts the stock DLL back; just repeat step 3 if that happens.
 To uninstall, delete the mod's `steam_api64.dll` and rename `steam_api64_orig.dll` back.
 
-If the game stops with *steam_api64_orig.dll is missing or broken*, step 2 was skipped: verify the
-game files in Steam (that brings the stock DLL back), then do steps 2 and 3 again.
+### If it does not work
+
+The mod says what is wrong - in a message box as the game starts, or in the panel (F7):
+
+- *The game's own Steam DLL is missing* - there is no `steam_api64_orig.dll`: step 2 was skipped, or
+  the mod's DLL was copied over the game's. In Steam, right-click the game, *Properties*, *Installed
+  Files*, *Verify integrity of game files* (that brings the game's `steam_api64.dll` back), then do
+  steps 2 and 3 again.
+- *steam_api64_orig.dll is not the game's own Steam DLL* - the file renamed in step 2 is not the one
+  the game came with (another game's, or another version's), and the game cannot run with it. Delete
+  `steam_api64_orig.dll` first - verifying the game files leaves it where it is, and a rename cannot
+  replace it - then the same fix: verify the game files, and steps 2 and 3 again.
+- *RE2CabbyCodes does not work with this version of Resident Evil 2*, or in the panel *a version of
+  the game the mod was not made for* - neither of the two versions above (a future update, say). Set
+  *Betas* to *None*, or uninstall the mod. The mod leaves that version of the game alone.
+
+A `steam_api64.dll` that is not the game's own but has every function the game uses still works as
+the original, and the log notes it. On the `dx11_non-rt` beta the game's own is an older Steam DLL
+than the current version's, and the log lists the 367 functions it lacks - none of which the game
+uses. Versions 1.0.1 and 1.0.2 of the mod log that as *steam_api64_orig.dll is not the Steam DLL the
+mod was made for*: with the beta's own DLL, the line is expected and nothing is wrong.
+
+**With REFramework on Windows**, versions 1.0.3 to 1.0.5 of the mod kept REFramework from ever seeing
+a frame of the game: its menu never came up, no REFramework mod or plugin worked, and its log
+(`re2_framework_log.txt`) repeats *Last chance encountered for hooking* every 11 seconds. This version
+leaves REFramework's way of finding the game's frames alone.
+
+For anything else, send `RE2CabbyCodes.log` and `RE2CabbyCodes.prev.log` from the game's folder -
+the files themselves: they are the record of what the mod found.
 
 ## Please read before using
 
@@ -173,9 +207,13 @@ game files in Steam (that brings the stock DLL back), then do steps 2 and 3 agai
   save slot shares - and saves it at once. Back it up before trying it (the whole `win64_save` folder).
 - The save files' Delete and Copy change your saves (and Steam Cloud) at once and cannot be undone:
   back up the `win64_save` folder before trying them.
-- Only the current Steam build (11636119, June 2023) has been looked at. Everything the mod uses is
-  found by name in the game's own type information, so in a build where something is missing, that
-  feature is greyed out with the reason beside it, and the log says what was missing.
+- Two Steam builds have been looked at: the current one (11636119, June 2023) and the `dx11_non-rt`
+  beta (11055033, April 2023). Everything the mod uses is found by name in the game's own type
+  information, so in a build where something is missing, that feature is greyed out with the reason
+  beside it, and the log says what was missing. On the `dx11_non-rt` version the save files' panel shows
+  no file sizes (that version keeps none), and three cheats - One hit kills, Save without ink ribbons,
+  Infinite wooden boards - are heard at other points of the game's code than on the current version,
+  so they are that version's newest parts: report anything odd with the log.
 
 ## Config
 
