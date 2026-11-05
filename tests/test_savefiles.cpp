@@ -6,10 +6,12 @@
 // The slots' file names (as this build's save folder has them: data000.bin, the
 // auto-save; data001Slot.bin.., the slots; data00-1.bin and data021Slot.bin,
 // the system and The Ghost Survivors' saves), the game's rows mapped to slots,
-// Steam's file list checked against them - and, given re2.exe, the getters'
+// Steam's file list checked against them, the moments the screen's frames are
+// seen at (src/stamp.h) - and, given re2.exe, the getters'
 // code the mod reads SaveFileDetail's and System.String's layout out of, at
 // this build's method RVAs (tools/tdb_dump.py --methods; the database's code
 // pointers are 0 on disk).
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +19,7 @@
 #include <vector>
 
 #include "../src/savefiles_rules.h"
+#include "../src/stamp.h"
 
 namespace {
 
@@ -27,6 +30,18 @@ int g_fail = 0;
 void check(bool ok, const char* what) {
   std::printf("%s  %s\n", ok ? "ok  " : "FAIL", what);
   if (!ok) ++g_fail;
+}
+
+// A screen's hook, on a game thread: a moment noted every time round, until stopped.
+struct Noter {
+  std::atomic<DWORD> moment{0};
+  std::atomic<bool> stop{false};
+};
+
+DWORD WINAPI note_moments(LPVOID arg) {
+  Noter* n = static_cast<Noter*>(arg);
+  while (!n->stop.load(std::memory_order_relaxed)) n->moment.store(re2cc::stamp::now(), std::memory_order_release);
+  return 0;
 }
 
 // re2.exe's bytes at an RVA (from the section holding it).
@@ -146,6 +161,45 @@ int main(int argc, char** argv) {
   check(rules::unix_seconds(ticks) == unix_t, what);
   check(rules::unix_seconds(0) == -1 && rules::unix_seconds(-5) == -1, "no time stamp: -1");
   check(rules::unix_seconds(unix_t) == -1, "Unix seconds taken for ticks: no plausible date, -1");
+
+  // --- the moments (src/stamp.h) ------------------------------------------------------------------------------------
+  // The screens' hooks note a moment (GetTickCount() | 1), and the tick and the panel age it on their own clock reads:
+  // one read in the moment's millisecond is 0 old, even or odd. Aged on the bare clock, a moment of an even millisecond
+  // was a millisecond ahead - 0xFFFFFFFF old - and the screen read as closed for as long as GetTickCount() held that
+  // value (up to 16 ms): the records and save files windows flashed with the cheats, the cursor with them (2026-11-02).
+  {
+    namespace stamp = re2cc::stamp;
+    check(stamp::age(1000 | 1, 1000) == 0 && stamp::within(1000 | 1, 400, 1000),
+          "a moment of an even millisecond, read in it: 0 old, recent");
+    check(stamp::age(1001, 1001) == 0 && stamp::within(1001, 400, 1001), "a moment of an odd millisecond, read in it: 0 old, recent");
+    check(stamp::within(1001, 400, 1016) && stamp::within(1001, 400, 1398) && !stamp::within(1001, 400, 1402),
+          "recent for 400 ms, not after");
+    check(stamp::age(0xFFFFFFF1u, 0x10) == 0x20 && stamp::within(0xFFFFFFF1u, 400, 0x10), "across the clock's wrap: 32 ms old");
+    check(!stamp::within(0, 400, 0) && !stamp::within(0, 400, 1000), "no moment: never recent");
+    // The clock itself, for a quarter of a second: a moment another thread notes all the while (the hook) is recent at
+    // every read (the tick, the panel) - loaded before the clock is read. The old reading (the bare clock, read first)
+    // is only counted: its misses need an even millisecond to come up.
+    Noter noter;
+    HANDLE th = CreateThread(nullptr, 0, &note_moments, &noter, 0, nullptr);
+    check(th != nullptr, "a thread to note moments");
+    if (th) {
+      while (!noter.moment.load(std::memory_order_acquire)) Sleep(0);
+      int n = 0, missed = 0, bare_missed = 0;
+      for (const DWORD start = GetTickCount(); GetTickCount() - start < 250; ++n) {
+        if (!stamp::within(noter.moment.load(std::memory_order_acquire), 400)) ++missed;
+        const DWORD clock = GetTickCount();
+        if (clock - noter.moment.load(std::memory_order_acquire) >= 400) ++bare_missed;
+      }
+      noter.stop.store(true);
+      WaitForSingleObject(th, INFINITE);
+      CloseHandle(th);
+      std::snprintf(what, sizeof(what),
+                    "%d reads of a moment another thread notes all the while, each recent (missed %d; the bare clock "
+                    "read first missed %d)",
+                    n, missed, bare_missed);
+      check(n > 0 && missed == 0, what);
+    }
+  }
 
   // --- the getters' code --------------------------------------------------------------------------------------------
   {

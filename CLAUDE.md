@@ -700,8 +700,9 @@ rewrites them to addresses in place as it starts and **never sets `initialized`*
     rewards only for its lists and `changeAllClassic`).
   - **The panel** (`src/records.cpp`, `src/records_rules.h`, the names in `src/records_text.h` from
     `tools/gen_records.py`): the two screens' `update` hooks stamp when a screen was last up and taking input
-    (`EnableInput_` +0x24, read from the object the hook is handed); while one is, the panel draws that set's
-    window instead of the cheats. From the tick, while its screen is up: **on** - the progress `clearRecord` leaves
+    (`EnableInput_` +0x24, read from the object the hook is handed; the moments are `src/stamp.h`'s, see The
+    screens' moments below); while one is, the panel draws that set's window instead of the cheats. From the tick,
+    while its screen is up: **on** - the progress `clearRecord` leaves
     (a better one kept; `records_rules.h`), `IsClearedRecord`/`IsNewClearedRecord`, each reward
     `IsOpenedReward` + `IsNewReward` (and the tofu pop-up flag) - `openRecord`'s writes but the costume NEW data
     and the "records cleared" pop-up - then `unlockRecord(id, true)`; The Ghost Survivors: `openRogueRecord`'s four
@@ -1047,6 +1048,29 @@ rewrites them to addresses in place as it starts and **never sets `initialized`*
     back out of the box and every inventory at the next load unless its reward is open (Records and their rewards),
     which the help text says.
 
+- **The screens' moments** (`src/stamp.h`; reported 2026-11-02: "the records imgui window is flickering", clicks on it
+  going astray - "it moved off from the clickable window" - and the cursor flickering, the Windows arrow and the
+  game's by turns). A screen's hook (on a game thread) notes when it last ran as `GetTickCount() | 1` (0 is "never"),
+  and the tick and the panel took its age on the **bare** clock: `now - seen < 400`. GetTickCount() holds a value for
+  up to 16 ms (15.6 on Windows; under Wine when its server is idle), and a moment noted while it held an even value is
+  a millisecond *ahead* of it - an age of -1, unsigned 49 days. So in every frame whose tick read the clock in the
+  same 16 ms as the screen's last frame, at an even value, the records screen (and the Load Game screen) read as
+  closed: by the odds, about a quarter of the frames at 120 a second, more above. On the pause menu the panel drew the
+  cheats in those frames and the records window in the rest; at the title's Bonus menu (no pause) the whole panel went
+  and came back, and with it the cursor (`ShowCursor`, the game's clip put back and let go, `WM_SETCURSOR`'s arrow or
+  the game's own), the dialogs forgotten and the mouse's clicks the game's in the frames it was gone. At 60 frames a
+  second (the laptop's vsync, 2026-09-25 - no records screen opened there) two frames rarely share a value.
+  RE4CabbyCodes found the same on 2026-10-23 ("the save files window flashed"), and `stamp.h` is its: moments are
+  `stamp::now()` and aged on a clock with bit 0 set too (`stamp::within(at, ms)`), the moment loaded before the clock
+  is read, so a moment another thread notes is never from a later millisecond. Every moment one thread notes for
+  another goes through it (the records screens' seen and input, the save screen's seen, open and input, its rows' and
+  refresh's times); the other timers are one thread's own bare clock against its own bare clock.
+  `tests/test_savefiles.cpp` checks it, a thread noting moments all the while against another reading them: 0 misses
+  in 44 million reads under Wine 11.20, where the old reading missed 29 million. The pointer: `show_cursor` now counts
+  the times it finds the cursor hidden again while the panel is up (the game's doing) and logs them as the panel goes
+  (`pointer: the cursor was hidden again N time(s) while the panel was up`), in case the game, not the panel, ever
+  flickers it.
+
 ### Save files and the Load Game screen (the save files, src/savefiles.cpp)
 - **The files**: `Steam/userdata/<id>/883710/remote/win64_save/`, one per slot of the engine's save service
   (`via.storage.saveService.SaveSlot`: System -1, Auto 0, Slot 1.., SlotMax 1024): `data00-1.bin` the system save,
@@ -1118,10 +1142,11 @@ rewrites them to addresses in place as it starts and **never sets `initialized`*
   calls' code - read by the tick only, into a copy published at once, once a second until it reads (the first via.*
   method code the mod reads; its linking time is not known). The hook on LoadBehavior's vtable slot 15 (the base's
   code, so the typewriter's SaveBehavior, same code in its own table, is not hooked) stamps the screen as up (SCENARIO
-  list, no load under way) and, twice a second or when the list object changes, reads the rows: row i is slot first +
-  i, and a list of another length, an entry that is not a SaveFileDetail, or a detail whose own Slot is not its row's,
-  makes the list **not consistent** - shown, but no change goes by it. Every request carries what the panel showed of
-  its rows (a hash of the slot, the engine's strings and the time stamp) and is dropped if the rows moved on.
+  list, no load under way; `src/stamp.h`'s moments, see The screens' moments) and, twice a second or when the list
+  object changes, reads the rows: row i is slot first + i, and a list of another length, an entry that is not a
+  SaveFileDetail, or a detail whose own Slot is not its row's, makes the list **not consistent** - shown, but no
+  change goes by it. Every request carries what the panel showed of its rows (a hash of the slot, the engine's
+  strings and the time stamp) and is dropped if the rows moved on.
   No change is taken while a refresh is pending, or before the list has been read again since the last one.
   **Delete**, from the tick: the manager's requests read (all clear, step idle), then armed with **one
   compare-exchange** of the qword the four request flags and `SlotId` share (+0x38..+0x3F of its fields, 8-aligned -
@@ -1748,6 +1773,14 @@ no ribbon, the save files' field-write refresh, the records panel, the difficult
   play time, save count)? That settles whether a slot's number is anywhere inside its file. Does "Continue" on the title
   now pick the copy (its time stamp)? Does the game's cursor jump back as expected after the refresh, and does the list
   refresh take long (the worker reads every slot through Steam)?
+- **The records and save files windows steady** (The screens' moments, 2026-11-02; not yet seen in game): beside the
+  records screen - from the title's Bonus menu above all, and the pause menu's - and the Load Game screen, at the
+  monitor's full refresh rate (120 Hz and up showed it most), the window stays put, the cheats never show in its place,
+  the cursor stays the Windows arrow over the whole game window while it is up, and a click lands where it is made:
+  a record's switch, the title bar dragged, "Complete all" and its confirmation. The log has one `records: the records
+  screen is up` per opening and one `is closed` per closing - never a run of them - and one `pointer: the cursor is
+  shown while the panel is up` per opening; a `pointer: the cursor was hidden again N time(s)` line as the panel goes
+  means the game hid it under the panel (seen within 250 ms each time): the cursor's own flicker, still to be fixed.
 - **REFramework beside the mod on Windows** (the fix of 2026-09-26, Overlay): the log should have one `overlay: a swap
   chain made for no window (CreateSwapChainForComposition, called from dinput8.dll+0x...) is not the game's` per
   REFramework hook, and REFramework's own log `Hooked DirectX 12` once, **no** `Last chance encountered for hooking`
@@ -1776,8 +1809,9 @@ no ribbon, the save files' field-write refresh, the records panel, the difficult
   game's own check, switched off un-earns it, 7 680 Ghost Survivors switches from 256 saves never close No Way Out) and
   its generated text (header-only).
 - `tests/test_savefiles.cpp` tests `src/savefiles_rules.h` (header-only): the slots' file names both ways, the game's
-  rows mapped to slots, Steam's file list checked against them, the time stamp's ticks, and - given re2.exe - the
-  getters' code SaveFileDetail's and System.String's layout is read from, at this build's method RVAs.
+  rows mapped to slots, Steam's file list checked against them, the time stamp's ticks, the screens' moments
+  (`src/stamp.h`, two threads), and - given re2.exe - the getters' code SaveFileDetail's and System.String's layout is
+  read from, at this build's method RVAs.
 - `tests/test_clock.cpp` tests the clock's arithmetic (`src/game.h`: `hold_by`, `taken_from`, `enemies_stuck`,
   `repaired`, header-only) - the record time a hold leaves, the enemies' clock it must not move, the give-back,
   and the repair, over 16 807 clocks x every held time. It also keeps the 2026-09-21 bug written down as a case:

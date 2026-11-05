@@ -151,6 +151,8 @@ bool g_game_clipping = false;
 RECT g_game_clip{};
 bool g_cursor_free = false;
 int g_cursor_shows = 0;
+bool g_cursor_shown = false;  // show_cursor(true) has run since the panel came
+int g_cursor_rehidden = 0;    // the cursor found hidden again since then (the log, as the panel goes)
 
 BOOL WINAPI hk_clip_cursor(const RECT* r) {
   EnterCriticalSection(&g_cursor_cs);
@@ -166,14 +168,24 @@ void show_cursor(bool show) {
   if (show) {
     int count = ShowCursor(TRUE) - 1;  // read the display count without changing it
     ShowCursor(FALSE);
-    const bool first = g_cursor_shows == 0;
+    // Hidden again under the panel: something on this thread - the game - hid it
+    // since the last look, and it stayed hidden until now (up to 250 ms).
+    if (g_cursor_shown && count < 0) ++g_cursor_rehidden;
     while (count < 0 && g_cursor_shows < 64) {
       count = ShowCursor(TRUE);
       ++g_cursor_shows;
     }
-    if (first && g_cursor_shows) logf("pointer: the cursor is shown while the panel is up (%d ShowCursor call(s))", g_cursor_shows);
-  } else if (g_cursor_shows) {
+    if (!g_cursor_shown && g_cursor_shows)
+      logf("pointer: the cursor is shown while the panel is up (%d ShowCursor call(s))", g_cursor_shows);
+    g_cursor_shown = true;
+  } else {
     for (; g_cursor_shows > 0; --g_cursor_shows) ShowCursor(FALSE);
+    if (g_cursor_rehidden)
+      logf("pointer: the cursor was hidden again %d time(s) while the panel was up - by the game; shown again within "
+           "250 ms each time",
+           g_cursor_rehidden);
+    g_cursor_rehidden = 0;
+    g_cursor_shown = false;
   }
 }
 

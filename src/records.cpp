@@ -14,6 +14,7 @@
 #include "re.h"
 #include "records_rules.h"
 #include "records_text.h"
+#include "stamp.h"
 #include "switch_eval.h"
 
 namespace re2cc::records {
@@ -197,8 +198,8 @@ char g_status[kSets][200] = {};
 bool g_status_error[kSets] = {};
 
 // The screens' frames (their hooks, on the game's threads): when one was last
-// seen, and last seen taking input; where its EnableInput_ is, worked out once
-// per screen object.
+// seen, and last seen taking input (moments, stamp.h); where its EnableInput_ is,
+// worked out once per screen object.
 std::atomic<DWORD> g_screen_seen[kSets], g_screen_input[kSets];
 std::atomic<uintptr_t> g_screen_obj[kSets], g_screen_input_at[kSets];
 
@@ -1203,30 +1204,27 @@ void screen_frame(Set s, uintptr_t behaviour) {
   }
   uint8_t input = 1;
   if (at && !mem::read_safe(at, &input)) input = 0;
-  const DWORD now = GetTickCount() | 1;
-  g_screen_seen[s].store(now, std::memory_order_relaxed);
-  if (input) g_screen_input[s].store(now, std::memory_order_relaxed);
+  const DWORD now = stamp::now();
+  g_screen_seen[s].store(now, std::memory_order_release);
+  if (input) g_screen_input[s].store(now, std::memory_order_release);
 }
 
 // The set whose records screen ran a frame lately, taking input or not (its
-// opening animation included) - -1: none.
+// opening animation included) - -1: none. The moments are loaded before the
+// clock is read (stamp.h).
 int screen_seen() {
-  const DWORD now = GetTickCount();
-  for (int s = 0; s < kSets; ++s) {
-    const DWORD seen = g_screen_seen[s].load(std::memory_order_relaxed);
-    if (seen && now - seen < 400) return s;
-  }
+  for (int s = 0; s < kSets; ++s)
+    if (stamp::within(g_screen_seen[s].load(std::memory_order_acquire), 400)) return s;
   return -1;
 }
 
 int screen_open() {
-  const DWORD now = GetTickCount();
   int best = -1;
   DWORD newest = 0;
   for (int s = 0; s < kSets; ++s) {
-    const DWORD seen = g_screen_seen[s].load(std::memory_order_relaxed);
-    const DWORD input = g_screen_input[s].load(std::memory_order_relaxed);
-    if (seen && now - seen < 400 && input && now - input < 400 && (best < 0 || seen - newest < 0x80000000u)) {
+    const DWORD seen = g_screen_seen[s].load(std::memory_order_acquire);
+    const DWORD input = g_screen_input[s].load(std::memory_order_acquire);
+    if (stamp::within(seen, 400) && stamp::within(input, 400) && (best < 0 || seen - newest < 0x80000000u)) {
       best = s;
       newest = seen;
     }
