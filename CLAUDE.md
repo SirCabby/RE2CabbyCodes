@@ -44,6 +44,8 @@ x86_64-w64-mingw32-g++ -std=c++20 -O2 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -static t
 WINEPREFIX=<scratch> wine tests/build/test_re.exe 'Z:\...\re2.exe'   # src/re.cpp against the real type database; method hooks
 x86_64-w64-mingw32-g++ -std=c++20 -O2 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -static tests/test_mem.cpp src/mem.cpp -o tests/build/test_mem.exe
 WINEPREFIX=<scratch> wine tests/build/test_mem.exe                   # guarded reads: bad addresses fail, a good read ~2 ns
+x86_64-w64-mingw32-g++ -std=c++20 -O2 -Wall -DWIN32_LEAN_AND_MEAN -DNOMINMAX -static tests/test_crash.cpp src/crash.cpp src/mem.cpp -o tests/build/test_crash.exe
+WINEPREFIX=<scratch> wine tests/build/test_crash.exe                 # (and `c2`) the crash logger beside other filters (Tooling notes)
 x86_64-w64-mingw32-g++ -std=c++20 -O2 -static tests/test_records.cpp -o tests/build/test_records.exe
 WINEPREFIX=<scratch> wine tests/build/test_records.exe                # the records panel's rules and text
 x86_64-w64-mingw32-g++ -std=c++20 -O2 -static tests/test_savefiles.cpp -o tests/build/test_savefiles.exe
@@ -1790,8 +1792,29 @@ no ribbon, the save files' field-write refresh, the records panel, the difficult
   (`its window WxH at X,Y ..., its monitor WxH`) say - does the request fail (the foreground window it names), or
   succeed with the window left small? Does it happen with the mod's `steam_api64.dll` taken out (REFramework and
   OptiScaler still in), and in Borderless Window?
+- **The crash logger's chaining** (2026-11-10, Tooling notes: `tests/test_crash.cpp`): run offline only - not
+  seen at a real crash, beside a crash handler that keeps the slot for itself, or on Windows.
 
 ## Tooling notes
+- **The crash logger** (`src/crash.cpp`; changed 2026-11-10, after reading a crash report from a user of the RE4
+  (2005) mod, RE4OGCabbyCodes, which has the same logger): ours stays on top of the filter the game sets through
+  its import and, once a second, of one set over it some other way, passing a crash on to it. Two faults found
+  there, both fixed: a filter set over ours that chains to the one it replaced - ours - made the two pass a crash
+  round until the stack ran out (the old file, in `test_crash`: 4,777 dumps, then the process gone); and with
+  `SetUnhandledExceptionFilter` made to do nothing (a ret over its first bytes, as some crash handlers do to keep
+  the slot - re4_tweaks does it to RE4 (2005) with a CrashDumps folder) each reassert took whatever rax held for
+  the previous filter and logged "ours is back on top" every second. Now: an exception ours is passing on, handed
+  back to ours on the same thread, stops there (a line); a new one raised inside the filter ours passed the last
+  one on to is passed on too, to three deep; the same exception given to ours again is a line, not a second dump;
+  a "previous filter" that is no executable code is not chained to; the API made inert - found past the jumps in
+  front of it (`jmp [rip+disp32]` with or without REX.W, `jmp rel32/rel8`, `mov rax,imm64; jmp rax`): a `ret`,
+  a `ret imm16`, or `xor eax,eax`/`xor rax,rax` and a ret - is said once and left alone (that handler then takes
+  every crash; this log has none); a filter that keeps putting itself over ours is logged once. A dump has every
+  register, the top 0xC0 bytes of the stack raw, the module-named return addresses, and the filter it is passed
+  on to. `tests/test_crash.cpp` calls the filter as UnhandledExceptionFilter would, with made-up access
+  violations: the game's filter through the hook, the same exception again, a filter that chains back, one that
+  raises another exception into ours and handles it, one that raises a new one every time, a previous filter
+  that is no code, two threads, and the API made inert with a ret (`c2`: ret 4).
 - `tests/test_discover.cpp` runs the mod's own start-up over a real `re2.exe`, either build, with no game
   running: the exe mapped as an image, `GetModuleHandleA(nullptr)` pointed at it, its database rebased in
   place, every method's code filled from its link records (`tools/tdb_dump.py --write-methods`), a stand-in
